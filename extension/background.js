@@ -361,13 +361,16 @@ async function findExistingFlowTab(projectId = "") {
             if (exactProjectTab) return exactProjectTab;
             const anyProjectTab = tabs.find(t => t.url && t.url.includes(`/project/${projectId}`));
             if (anyProjectTab) return anyProjectTab;
+            return null;
         }
 
-        const completedFlowTab = tabs.find(t => t.url && t.url.startsWith("https://flow.google.com/") && t.status === "complete");
-        if (completedFlowTab) return completedFlowTab;
+        const anyCompletedProjectTab = tabs.find(t => t.url && t.url.includes("/project/") && t.status === "complete");
+        if (anyCompletedProjectTab) return anyCompletedProjectTab;
 
-        const anyCompletedTab = tabs.find(t => t.status === "complete");
-        return anyCompletedTab || tabs[0];
+        const anyProjectTab = tabs.find(t => t.url && t.url.includes("/project/"));
+        if (anyProjectTab) return anyProjectTab;
+
+        return null;
     } catch (e) {
         return null;
     }
@@ -406,6 +409,9 @@ async function waitForFlowPage(tabId, projectId = "", timeoutMs = 30000) {
                     `/project/${encodeURIComponent(projectId)}`,
                 ];
                 if (!expectedPaths.includes(actualPath)) {
+                    if (actualPath.includes("/404") || url.search.includes("reason=project")) {
+                        throw new Error(`Project ID (${projectId}) 在当前 Google 账号下不存在 (Google 返回 404: reason=project)。请在 flow.google.com 新建或打开一个项目，将浏览器地址栏中的真实 Project ID 填入管理后台。`);
+                    }
                     await sleep(500);
                     continue;
                 }
@@ -859,6 +865,7 @@ async function connectWS() {
 async function handleGetToken(data, socket) {
     let newTabId = null;
     let retainTabForBatchId = "";
+    let isSharedTab = false;
     const isFlowRequest = data.type === "submit_flow_request";
     const batchId = isFlowRequest
         ? String((data.flow_request && data.flow_request.batch_id) || "").trim()
@@ -880,7 +887,6 @@ async function handleGetToken(data, socket) {
         // 同一 batch_id 的重试优先回到被保留的那个标签页，页内缓存就在那里。
         const retainedTabId = batchId ? await takeRetainedTab(batchId) : null;
         let flowTab;
-        let isSharedTab = false;
         if (retainedTabId) {
             newTabId = retainedTabId;
             isSharedTab = true;

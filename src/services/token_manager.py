@@ -32,6 +32,16 @@ class TokenManager:
     def get_last_refresh_error(self, token_id: int) -> Optional[str]:
         return self._last_refresh_error.get(token_id)
 
+    async def _clear_token_projects(self, token_id: int):
+        """安全清理 Token 关联的旧项目池记录"""
+        if hasattr(self.db, "delete_projects_by_token"):
+            await self.db.delete_projects_by_token(token_id)
+        else:
+            projects = await self.db.get_projects_by_token(token_id)
+            for p in projects:
+                if hasattr(self.db, "delete_project"):
+                    await self.db.delete_project(p.project_id)
+
     async def _get_token_lock(
         self,
         lock_map: dict[int, asyncio.Lock],
@@ -467,7 +477,24 @@ class TokenManager:
         if at_expires is not None:
             update_fields["at_expires"] = at_expires
         if project_id is not None:
-            update_fields["current_project_id"] = project_id
+            normalized_project_id = str(project_id).strip()
+            update_fields["current_project_id"] = normalized_project_id
+            if normalized_project_id:
+                try:
+                    await self._clear_token_projects(token_id)
+                    p_name = project_name or (token.current_project_name if token else None) or "Project"
+                    new_proj = Project(
+                        project_id=normalized_project_id,
+                        token_id=token_id,
+                        project_name=p_name,
+                        tool_name="PINHOLE"
+                    )
+                    await self.db.add_project(new_proj)
+                    debug_logger.log_info(
+                        f"[UPDATE_TOKEN] Token {token_id} 项目池已重置并绑定新 Project ID: {normalized_project_id}"
+                    )
+                except Exception as proj_err:
+                    debug_logger.log_warning(f"[UPDATE_TOKEN] 同步更新 projects 表失败: {proj_err}")
         if project_name is not None:
             update_fields["current_project_name"] = project_name
         if remark is not None:
@@ -1231,12 +1258,30 @@ class TokenManager:
             projects = [project for project in await self.db.get_projects_by_token(token_id) if project.is_active]
             projects = self._sort_projects(projects)
 
+            if token.current_project_id:
+                has_current = any(p.project_id == token.current_project_id for p in projects)
+                if not has_current:
+                    await self._clear_token_projects(token_id)
+                    new_proj = Project(
+                        project_id=token.current_project_id,
+                        token_id=token_id,
+                        project_name=token.current_project_name or "Project",
+                        tool_name="PINHOLE"
+                    )
+                    new_proj.id = await self.db.add_project(new_proj)
+                    projects = [new_proj]
+
             try:
-                project_pool_size = self._get_project_pool_size()
+                is_extension = (config.captcha_method == "extension")
+                project_pool_size = 1 if is_extension else self._get_project_pool_size()
                 while len(projects) < project_pool_size:
-                    new_project = await self._create_project_for_token(token, len(projects) + 1)
-                    projects.append(new_project)
-                    projects = self._sort_projects(projects)
+                    try:
+                        new_project = await self._create_project_for_token(token, len(projects) + 1)
+                        projects.append(new_project)
+                        projects = self._sort_projects(projects)
+                    except Exception as e:
+                        debug_logger.log_warning(f"[PROJECT] 补充项目池失败 (跳过): {e}")
+                        break
 
                 selectable_projects = projects[:project_pool_size]
                 selected_project = self._select_next_project(token, selectable_projects)

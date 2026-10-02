@@ -405,6 +405,7 @@ class BrowserCaptchaExtensionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("empty_recaptcha_token", background)
         self.assertIn("phase:", background)
         self.assertIn('message.type !== "reconnect"', background)
+        self.assertIn("let isSharedTab = false;", background)
         self.assertIn('id="runtimeStatus"', options)
         self.assertIn('id="runtimeLogs"', options)
         self.assertIn('chrome.storage.onChanged.addListener', options_js)
@@ -439,7 +440,7 @@ class BrowserCaptchaExtensionTests(unittest.IsolatedAsyncioTestCase):
         from pathlib import Path
 
         manifest = json.loads((Path(__file__).parents[1] / "extension" / "manifest.json").read_text())
-        self.assertEqual(manifest["version"], "1.2.8")
+        self.assertEqual(manifest["version"], "1.2.9")
         self.assertIn("cookies", manifest["permissions"])
 
     def test_flow_fetch_in_progress_is_retryable(self):

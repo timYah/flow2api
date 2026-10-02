@@ -1233,6 +1233,12 @@ class Database:
             await db.execute("DELETE FROM projects WHERE project_id = ?", (project_id,))
             await db.commit()
 
+    async def delete_projects_by_token(self, token_id: int):
+        """Delete all projects for a token"""
+        async with self._connect(write=True) as db:
+            await db.execute("DELETE FROM projects WHERE token_id = ?", (token_id,))
+            await db.commit()
+
     # Task operations
     async def create_task(self, task: Task) -> int:
         """Create a new task"""
