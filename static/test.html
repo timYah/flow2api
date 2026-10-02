@@ -111,6 +111,59 @@ h1 { text-align: center; margin-bottom: 8px; font-size: 24px; color: #7c8aff; }
 .output-result img { max-width: 100%; border-radius: 8px; margin-top: 8px; }
 .output-result video { max-width: 100%; border-radius: 8px; margin-top: 8px; }
 
+.count-selector {
+  display: flex; gap: 8px; background: #0f1117; padding: 4px; border-radius: 8px; border: 1px solid #2a2b3a;
+}
+.count-btn {
+  flex: 1; padding: 8px 12px; background: transparent; color: #888; border: 1px solid transparent;
+  border-radius: 6px; font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.2s; text-align: center;
+}
+.count-btn:hover { color: #e1e1e6; background: #1a1b26; }
+.count-btn.active { background: #2a2b5a; color: #7c8aff; border-color: #7c8aff; font-weight: 600; }
+.count-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.image-grid {
+  display: grid; gap: 12px; margin-top: 12px;
+}
+.image-grid[data-cols="1"] { grid-template-columns: 1fr; }
+.image-grid[data-cols="2"] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.image-grid[data-cols="3"], .image-grid[data-cols="4"] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (max-width: 640px) {
+  .image-grid[data-cols="2"], .image-grid[data-cols="3"], .image-grid[data-cols="4"] { grid-template-columns: 1fr; }
+}
+
+.image-card {
+  position: relative; background: #0f1117; border: 1px solid #2a2b3a; border-radius: 8px;
+  overflow: hidden; display: flex; flex-direction: column;
+}
+.image-card-header {
+  display: flex; justify-content: space-between; align-items: center; padding: 8px 12px;
+  background: #141520; font-size: 12px; color: #888; border-bottom: 1px solid #2a2b3a;
+}
+.image-card-header .badge { font-weight: 600; color: #7c8aff; }
+.image-card-header .card-status { font-size: 11px; }
+.image-card-body {
+  position: relative; min-height: 180px; display: flex; align-items: center; justify-content: center; background: #0b0d13;
+}
+.image-card-body img {
+  width: 100%; height: auto; display: block; border-radius: 0; cursor: pointer; transition: opacity 0.2s; margin-top: 0;
+}
+.image-card-body img:hover { opacity: 0.95; }
+.image-card-footer {
+  padding: 8px 12px; font-size: 12px; color: #666; background: #141520;
+  border-top: 1px solid #1e1f2e; display: flex; justify-content: space-between; align-items: center;
+}
+.image-card-footer a { color: #7c8aff; text-decoration: none; }
+.image-card-footer a:hover { text-decoration: underline; }
+.image-card-loading {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px 16px; color: #888; font-size: 13px;
+}
+.image-card-spinner {
+  width: 28px; height: 28px; border: 2px solid #2a2b3a; border-top-color: #7c8aff;
+  border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 10px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
 .model-list::-webkit-scrollbar, .output-log::-webkit-scrollbar { width: 4px; }
 .model-list::-webkit-scrollbar-thumb, .output-log::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
 
@@ -146,6 +199,16 @@ h1 { text-align: center; margin-bottom: 8px; font-size: 24px; color: #7c8aff; }
           <textarea id="promptInput" placeholder="描述你想生成的内容...">一只可爱的橘猫趴在窗台上晒太阳，窗外是樱花盛开的春天</textarea>
         </div>
 
+        <div class="form-group" id="imageCountGroup" style="display:none;">
+          <label>数量 <span style="color:#666;font-size:12px;">(一次生成 1~4 张图片)</span></label>
+          <div class="count-selector" id="imageCountSelector">
+            <button type="button" class="count-btn active" data-count="1">1 张</button>
+            <button type="button" class="count-btn" data-count="2">2 张</button>
+            <button type="button" class="count-btn" data-count="3">3 张</button>
+            <button type="button" class="count-btn" data-count="4">4 张</button>
+          </div>
+        </div>
+
         <div class="form-group" id="imageUploadGroup" style="display:none;">
           <label>上传图片 <span id="imageLimit" style="color:#666;font-size:12px;"></span></label>
           <div class="image-upload-area" id="imageUploadArea">
@@ -168,11 +231,12 @@ h1 { text-align: center; margin-bottom: 8px; font-size: 24px; color: #7c8aff; }
 </div>
 
 <script>
-const STATE = { selectedModel: null, modelConfig: null, images: [], generating: false };
+const STATE = { selectedModel: null, modelConfig: null, images: [], generating: false, imageCount: 1 };
 </script>
 <script>
 // Model categories for sidebar
 const MODEL_CATEGORIES = {
+  "Gemini Omni Flash 视频": { filter: m => m.startsWith("omni") || m.startsWith("omini") },
   "Gemini 3.1 Flash 图片": { filter: m => m.startsWith("gemini-3.1-flash-image") },
   "Gemini 3.0 Pro 图片": { filter: m => m.startsWith("gemini-3.0-pro-image") },
   "Imagen 4.0 图片": { filter: m => m.startsWith("imagen-4.0") },
@@ -183,6 +247,13 @@ const MODEL_CATEGORIES = {
 };
 
 const FALLBACK_MODELS = {
+  "omni": "Video generation (alias) - Omni Flash, supports 0-3 reference images and landscape/portrait",
+  "omni_8s": "Video generation (alias) - Omni Flash 8s, supports 0-3 reference images and landscape/portrait",
+  "omni_10s": "Video generation (alias) - Omni Flash 10s, supports 0-3 reference images and landscape/portrait",
+  "omni_landscape": "Video generation - Omni Flash landscape",
+  "omni_portrait": "Video generation - Omni Flash portrait",
+  "omni_10s_landscape": "Video generation - Omni Flash 10s landscape",
+  "omni_10s_portrait": "Video generation - Omni Flash 10s portrait",
   "gemini-3.1-flash-image": "Image generation (alias) - aspects: landscape, portrait, square, four-three, three-four; sizes: 2k, 4k",
   "gemini-3.0-pro-image": "Image generation (alias) - aspects: landscape, portrait, square, four-three, three-four; sizes: 2k, 4k",
   "imagen-4.0-generate-preview": "Image generation (alias) - aspects: landscape, portrait",
@@ -317,12 +388,14 @@ function getModelType(modelId) {
 
 function getModelMeta(modelId) {
   // Determine supports_images, min/max from model name patterns
+  const isOmni = modelId.startsWith("omni") || modelId.startsWith("omini");
   const isI2V = modelId.includes("i2v");
   const isR2V = modelId.includes("r2v");
   const isT2V = modelId.includes("t2v");
   const isImage = getModelType(modelId) === "image";
 
   if (isImage) return { type: "image", supportsImages: true, minImages: 0, maxImages: 5 };
+  if (isOmni) return { type: "video", supportsImages: true, minImages: 0, maxImages: 3 };
   if (isI2V) return { type: "video", supportsImages: true, minImages: 1, maxImages: 2 };
   if (isR2V) return { type: "video", supportsImages: true, minImages: 0, maxImages: 3 };
   return { type: "video", supportsImages: false, minImages: 0, maxImages: 0 };
@@ -400,15 +473,53 @@ function selectModel(modelId) {
     uploadGroup.style.display = "none";
   }
 
+  // Show/hide image count
+  const countGroup = document.getElementById("imageCountGroup");
+  if (countGroup) {
+    countGroup.style.display = meta.type === "image" ? "block" : "none";
+  }
+
   // Reset image previews
   document.getElementById("imagePreviewList").innerHTML = "";
   document.getElementById("imageHint").style.display = "block";
 
   // Enable button
-  const btn = document.getElementById("btnGenerate");
-  btn.disabled = false;
-  btn.textContent = meta.type === "image" ? "🎨 生成图片" : "🎬 生成视频";
+  updateGenerateButton();
 }
+
+function updateGenerateButton() {
+  const btn = document.getElementById("btnGenerate");
+  if (!STATE.selectedModel) {
+    btn.disabled = true;
+    btn.textContent = "选择模型后开始生成";
+    return;
+  }
+  btn.disabled = STATE.generating;
+  if (STATE.generating) {
+    btn.textContent = "⏳ 生成中...";
+    return;
+  }
+  const meta = STATE.modelConfig;
+  if (meta && meta.type === "image") {
+    const count = STATE.imageCount || 1;
+    btn.textContent = count > 1 ? `🎨 生成图片 (${count}张)` : "🎨 生成图片";
+  } else {
+    btn.textContent = "🎬 生成视频";
+  }
+}
+
+// Image count selector
+document.querySelectorAll(".count-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    if (STATE.generating) return;
+    const count = parseInt(btn.dataset.count, 10) || 1;
+    STATE.imageCount = count;
+    document.querySelectorAll(".count-btn").forEach(b => {
+      b.classList.toggle("active", b === btn);
+    });
+    updateGenerateButton();
+  });
+});
 
 // Image upload handling
 const uploadArea = document.getElementById("imageUploadArea");
@@ -466,6 +577,16 @@ function removeImage(idx) {
 // Generation
 document.getElementById("btnGenerate").onclick = generate;
 
+function escapeHtml(str) {
+  if (!str) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 async function generate() {
   if (!STATE.selectedModel || STATE.generating) return;
 
@@ -476,19 +597,29 @@ async function generate() {
   if (!apiKey) { alert("请输入 API Key"); return; }
   if (!baseUrl) { alert("请输入服务地址"); return; }
 
+  const meta = STATE.modelConfig;
+  const isImageModel = meta && meta.type === "image";
+  const totalCount = isImageModel ? Math.max(1, Math.min(4, STATE.imageCount || 1)) : 1;
+
   STATE.generating = true;
-  const btn = document.getElementById("btnGenerate");
-  btn.disabled = true;
-  btn.textContent = "⏳ 生成中...";
+  updateGenerateButton();
+  document.querySelectorAll(".count-btn").forEach(b => b.disabled = true);
 
   const dot = document.getElementById("statusDot");
   dot.className = "status-dot status-running";
-  document.getElementById("statusText").textContent = "生成中...";
-  document.getElementById("outputLog").textContent = "";
-  document.getElementById("outputResult").innerHTML = "";
+  document.getElementById("statusText").textContent = totalCount > 1 ? `生成中 (0/${totalCount})...` : "生成中...";
 
   const log = document.getElementById("outputLog");
-  const appendLog = (text) => { log.textContent += text; log.scrollTop = log.scrollHeight; };
+  log.textContent = "";
+  const resultDiv = document.getElementById("outputResult");
+  resultDiv.innerHTML = "";
+
+  const startTime = Date.now();
+  const timeStr = () => new Date().toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+
+  log.textContent += `[${timeStr()}] 模型: ${STATE.selectedModel}${totalCount > 1 ? ` (数量: ${totalCount} 张)` : ''}\n`;
+  log.textContent += `[${timeStr()}] 提示词: ${prompt.substring(0, 100)}${prompt.length > 100 ? '...' : ''}\n`;
+  log.textContent += `[${timeStr()}] ${totalCount > 1 ? `开始并发发起 ${totalCount} 个生成请求...\n\n` : '开始请求...\n'}`;
 
   // Build messages
   const content = [];
@@ -496,84 +627,204 @@ async function generate() {
   STATE.images.forEach(dataUrl => {
     content.push({ type: "image_url", image_url: { url: dataUrl } });
   });
-
   const messages = [{ role: "user", content: content.length === 1 ? prompt : content }];
-
   const body = { model: STATE.selectedModel, messages, stream: true };
 
-  const startTime = Date.now();
-  appendLog(`[${new Date().toLocaleTimeString()}] 模型: ${STATE.selectedModel}\n`);
-  appendLog(`[${new Date().toLocaleTimeString()}] 提示词: ${prompt.substring(0, 100)}${prompt.length > 100 ? '...' : ''}\n`);
-  appendLog(`[${new Date().toLocaleTimeString()}] 开始请求...\n`);
-
-  try {
-    const resp = await fetch(`${baseUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-
-    if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error(`HTTP ${resp.status}: ${errText}`);
+  // Initialize result display cards for images
+  if (isImageModel) {
+    const grid = document.createElement("div");
+    grid.className = "image-grid";
+    grid.dataset.cols = String(totalCount);
+    for (let i = 1; i <= totalCount; i++) {
+      const card = document.createElement("div");
+      card.className = "image-card";
+      card.id = `imageCard_${i}`;
+      card.innerHTML = `
+        <div class="image-card-header">
+          <span class="badge">图片 #${i}</span>
+          <span class="card-status" id="cardStatus_${i}" style="color:#facc15;">生成中...</span>
+        </div>
+        <div class="image-card-body" id="cardBody_${i}">
+          <div class="image-card-loading">
+            <div class="image-card-spinner"></div>
+            <div>正在生成第 ${i} 张...</div>
+          </div>
+        </div>
+        <div class="image-card-footer" id="cardFooter_${i}">
+          <span style="color:#666;">处理中...</span>
+        </div>
+      `;
+      grid.appendChild(card);
     }
+    resultDiv.appendChild(grid);
+  }
 
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let fullContent = "";
-    let buffer = "";
+  let completedCount = 0;
+  let successCount = 0;
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+  const runTask = async (taskIndex) => {
+    const taskStartTime = Date.now();
+    const prefix = totalCount > 1 ? `[#${taskIndex}] ` : '';
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
+    const appendTaskLog = (text) => {
+      if (totalCount === 1) {
+        log.textContent += text;
+      } else {
+        const lines = text.split("\n");
+        const formatted = lines.map((l, idx) => {
+          if (idx === lines.length - 1 && l === '') return '';
+          return `${prefix}${l}`;
+        }).join("\n");
+        log.textContent += formatted + (text.endsWith("\n") ? "\n" : "");
+      }
+      log.scrollTop = log.scrollHeight;
+    };
 
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-        const data = line.slice(6).trim();
-        if (data === "[DONE]") continue;
+    try {
+      const resp = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
 
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.error) {
-            appendLog(`\n❌ 错误: ${JSON.stringify(parsed.error)}\n`);
-            continue;
-          }
-          const choices = parsed.choices || [];
-          if (choices.length > 0) {
-            const delta = choices[0].delta || {};
-            const content = delta.reasoning_content || delta.content || "";
-            if (content) {
-              fullContent += content;
-              appendLog(content);
+      if (!resp.ok) {
+        const errText = await resp.text();
+        throw new Error(`HTTP ${resp.status}: ${errText}`);
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let fullContent = "";
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const data = line.slice(6).trim();
+          if (data === "[DONE]") continue;
+
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.error) {
+              appendTaskLog(`\n❌ 错误: ${JSON.stringify(parsed.error)}\n`);
+              continue;
             }
+            const choices = parsed.choices || [];
+            if (choices.length > 0) {
+              const delta = choices[0].delta || {};
+              const chunkContent = delta.reasoning_content || delta.content || "";
+              if (chunkContent) {
+                fullContent += chunkContent;
+                appendTaskLog(chunkContent);
+              }
+            }
+          } catch (e) {
+            // skip unparseable chunks
           }
-        } catch (e) {
-          // skip unparseable chunks
         }
       }
+
+      const taskElapsed = ((Date.now() - taskStartTime) / 1000).toFixed(1);
+      appendTaskLog(`\n✅ 完成，耗时 ${taskElapsed}s\n`);
+
+      if (isImageModel) {
+        const imgRegex = /!\[.*?\]\((.*?)\)/g;
+        let match = imgRegex.exec(fullContent);
+        const cardStatus = document.getElementById(`cardStatus_${taskIndex}`);
+        const cardBody = document.getElementById(`cardBody_${taskIndex}`);
+        const cardFooter = document.getElementById(`cardFooter_${taskIndex}`);
+
+        if (match && match[1]) {
+          const imgUrl = match[1];
+          successCount++;
+          if (cardStatus) {
+            cardStatus.textContent = `完成 (${taskElapsed}s)`;
+            cardStatus.style.color = "#4ade80";
+          }
+          if (cardBody) {
+            cardBody.innerHTML = `<img src="${imgUrl}" alt="生成结果 #${taskIndex}" loading="lazy" title="点击新窗口查看原图" onclick="window.open('${imgUrl}', '_blank')">`;
+          }
+          if (cardFooter) {
+            cardFooter.innerHTML = `<span>耗时 ${taskElapsed}s</span><a href="${imgUrl}" target="_blank">查看原图 ↗</a>`;
+          }
+        } else {
+          if (cardStatus) {
+            cardStatus.textContent = `无图片输出`;
+            cardStatus.style.color = "#facc15";
+          }
+          if (cardBody) {
+            cardBody.innerHTML = `<div style="padding:16px;color:#aaa;font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:240px;overflow-y:auto;">${escapeHtml(fullContent)}</div>`;
+          }
+          if (cardFooter) {
+            cardFooter.innerHTML = `<span>耗时 ${taskElapsed}s</span><span style="color:#888;">未检测到图片</span>`;
+          }
+        }
+      } else {
+        renderResult(fullContent);
+        successCount++;
+      }
+
+    } catch (e) {
+      const taskElapsed = ((Date.now() - taskStartTime) / 1000).toFixed(1);
+      appendTaskLog(`\n❌ 请求失败: ${e.message}\n`);
+      if (isImageModel) {
+        const cardStatus = document.getElementById(`cardStatus_${taskIndex}`);
+        const cardBody = document.getElementById(`cardBody_${taskIndex}`);
+        const cardFooter = document.getElementById(`cardFooter_${taskIndex}`);
+        if (cardStatus) {
+          cardStatus.textContent = `失败`;
+          cardStatus.style.color = "#f87171";
+        }
+        if (cardBody) {
+          cardBody.innerHTML = `<div style="padding:20px 14px;color:#f87171;font-size:13px;text-align:center;">生成失败<br><span style="color:#888;font-size:11px;margin-top:6px;display:block;word-break:break-all;">${escapeHtml(e.message)}</span></div>`;
+        }
+        if (cardFooter) {
+          cardFooter.innerHTML = `<span>耗时 ${taskElapsed}s</span><span style="color:#f87171;">失败</span>`;
+        }
+      }
+    } finally {
+      completedCount++;
+      if (totalCount > 1) {
+        document.getElementById("statusText").textContent = `生成中 (${completedCount}/${totalCount} 完成)...`;
+      }
+    }
+  };
+
+  try {
+    const taskPromises = [];
+    for (let i = 1; i <= totalCount; i++) {
+      taskPromises.push(runTask(i));
+    }
+    await Promise.all(taskPromises);
+
+    const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    if (totalCount > 1) {
+      log.textContent += `\n[${timeStr()}] 全部任务结束，成功 ${successCount}/${totalCount}，总耗时 ${totalElapsed}s\n`;
+      log.scrollTop = log.scrollHeight;
     }
 
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    appendLog(`\n\n[${new Date().toLocaleTimeString()}] 完成，耗时 ${elapsed}s\n`);
+    if (successCount === totalCount) {
+      dot.className = "status-dot status-done";
+      document.getElementById("statusText").textContent = totalCount > 1 ? `全部完成 (${successCount}/${totalCount} 张，${totalElapsed}s)` : `完成 (${totalElapsed}s)`;
+    } else if (successCount > 0) {
+      dot.className = "status-dot status-done";
+      document.getElementById("statusText").textContent = `部分完成 (${successCount}/${totalCount} 成功，${totalElapsed}s)`;
+    } else {
+      dot.className = "status-dot status-error";
+      document.getElementById("statusText").textContent = `失败 (${totalElapsed}s)`;
+    }
 
-    // Render result
-    renderResult(fullContent);
-    dot.className = "status-dot status-done";
-    document.getElementById("statusText").textContent = `完成 (${elapsed}s)`;
-
-  } catch (e) {
-    appendLog(`\n❌ 请求失败: ${e.message}\n`);
-    dot.className = "status-dot status-error";
-    document.getElementById("statusText").textContent = "失败";
   } finally {
     STATE.generating = false;
-    btn.disabled = false;
-    const meta = STATE.modelConfig;
-    btn.textContent = meta && meta.type === "image" ? "🎨 生成图片" : "🎬 生成视频";
+    updateGenerateButton();
+    document.querySelectorAll(".count-btn").forEach(b => b.disabled = false);
   }
 }
 

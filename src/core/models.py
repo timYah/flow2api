@@ -65,6 +65,7 @@ class Project(BaseModel):
 
     id: Optional[int] = None
     project_id: str  # VideoFX项目UUID
+    client_project_id: Optional[str] = None  # 客户端传入的稳定项目别名
     token_id: int  # 关联的Token ID
     project_name: str  # 项目名称
     tool_name: str = "PINHOLE"  # 工具名称,固定为PINHOLE
@@ -298,6 +299,7 @@ class GeminiGenerateContentRequest(BaseModel):
     contents: List[GeminiContent]
     generationConfig: Optional[GenerationConfigParam] = None
     systemInstruction: Optional[GeminiContent] = None
+    project_id: Optional[str] = None
 
     model_config = ConfigDict(extra="allow")
 
@@ -313,6 +315,7 @@ class ChatCompletionRequest(BaseModel):
     # Flow2API specific parameters
     image: Optional[str] = None  # Base64 encoded image (deprecated, use messages)
     video: Optional[str] = None  # Base64 encoded video (deprecated)
+    project_id: Optional[str] = None  # Optional registered Flow project for image generation
     # Gemini extension parameters (from extra_body or top-level)
     generationConfig: Optional[GenerationConfigParam] = None
     contents: Optional[List[Any]] = None  # Gemini native contents

@@ -1,3 +1,5 @@
+# Legacy pip compatibility file. The project source of truth is pyproject.toml
+# and uv.lock; use `uv sync` for development and deployment.
 fastapi==0.119.0
 uvicorn[standard]==0.32.1
 aiosqlite==0.20.0
@@ -9,5 +11,6 @@ bcrypt==4.2.1
 python-multipart==0.0.20
 python-dateutil==2.8.2
 playwright>=1.40.0
-nodriver>=0.48.0
+nodriver>=0.48.0; python_version >= "3.10"
 prometheus-client==0.22.1
+pillow>=10.0.0

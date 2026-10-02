@@ -65,6 +65,57 @@
       font-size: 13px;
       color: #065f46;
     }
+    .runtime {
+      margin-top: 24px;
+      padding-top: 18px;
+      border-top: 1px solid #e5e7eb;
+    }
+    .runtime-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px 16px;
+      margin-top: 12px;
+    }
+    .runtime-item {
+      min-width: 0;
+      font-size: 13px;
+    }
+    .runtime-label {
+      color: #6b7280;
+      margin-bottom: 3px;
+    }
+    .runtime-value {
+      overflow-wrap: anywhere;
+      color: #111827;
+    }
+    .runtime-value[data-status="connected"] { color: #047857; }
+    .runtime-value[data-status="stale"] { color: #b45309; }
+    .runtime-value[data-status="busy"] { color: #b45309; }
+    .runtime-value[data-status="error"] { color: #b91c1c; }
+    .runtime-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .runtime-actions button.secondary {
+      background: #e5e7eb;
+      color: #111827;
+    }
+    .logs {
+      margin: 12px 0 0;
+      padding: 10px;
+      max-height: 260px;
+      overflow: auto;
+      background: #111827;
+      color: #e5e7eb;
+      border-radius: 8px;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    @media (max-width: 560px) {
+      .runtime-grid { grid-template-columns: 1fr; }
+    }
     code {
       background: #f3f4f6;
       border-radius: 6px;
@@ -76,23 +127,46 @@
   <div class="wrap">
     <div class="panel">
       <h1>Flow2API Captcha Worker</h1>
-      <p>给当前浏览器实例设置一个独立的路由键，Flow2API 后端就能把对应账号的验证码请求固定发到这个实例。</p>
+      <p>此扩展在当前已登录的 Chrome Flow 项目页内完成 reCAPTCHA 和图片生成请求提交。Flow2API Python 服务仍负责参考图上传、结果处理和 API 响应。</p>
+      <p class="hint">使用前请先在 <code>chrome://extensions</code> 开启“开发者模式”，选择“加载已解压的扩展程序”，加载仓库中的 <code>extension/</code> 目录。</p>
 
-      <label for="routeKey">Route Key</label>
-      <input id="routeKey" type="text" placeholder="例如 9223">
+      <label for="routeKey">Route Key（可选）</label>
+      <input id="routeKey" type="text" placeholder="例如 browser-01">
+      <div class="hint">需要绑定指定账号时，在管理台对应 Token 的“扩展路由键”中填写相同值；每个 Chrome 实例建议使用不同值。留空表示使用未指定路由的连接。</div>
 
-      <label for="clientLabel">Client Label</label>
-      <input id="clientLabel" type="text" placeholder="例如 browser-9223">
+      <label for="clientLabel">Client Label（可选）</label>
+      <input id="clientLabel" type="text" placeholder="例如 browser-01">
+
+      <label for="maxConcurrency">最大并发任务数</label>
+      <input id="maxConcurrency" type="number" min="1" max="8" step="1" placeholder="3 (默认 3，建议 2-4)">
+      <div class="hint">同时在 Chrome 中打开标签页执行 Flow 请求的并发上限。多场景批量生成或局域网机器推荐 2-4。</div>
 
       <label for="serverUrl">WebSocket URL</label>
       <input id="serverUrl" type="text" placeholder="ws://127.0.0.1:8000/captcha_ws">
+      <div class="hint">本机服务通常填写 <code>ws://127.0.0.1:8000/captcha_ws</code>；远程部署时替换为可访问的 <code>ws://</code> 或 <code>wss://</code> 地址。</div>
 
       <label for="apiKey">Flow2API API Key</label>
-      <input id="apiKey" type="password" placeholder="管理后台里的 API Key">
+      <input id="apiKey" type="password" placeholder="管理台“API 密钥配置”中的 API Key">
 
       <button id="saveBtn" type="button">保存</button>
       <div class="status" id="status"></div>
-      <div class="hint">管理台 token 里填写同样的 <code>Route Key</code>，比如 9223 对 9223。后端会使用 API Key 校验 WebSocket 连接。</div>
+      <div class="hint">保存后扩展后台会自动连接并重连 WebSocket。扩展不需要配置 Token 同步插件的连接地址或连接 Token。</div>
+
+      <section class="runtime" aria-labelledby="runtimeTitle">
+        <h2 id="runtimeTitle">运行状态</h2>
+        <div class="runtime-grid">
+          <div class="runtime-item"><div class="runtime-label">连接状态</div><div class="runtime-value" id="runtimeStatus">读取中...</div></div>
+          <div class="runtime-item"><div class="runtime-label">当前 Route Key</div><div class="runtime-value" id="runtimeRouteKey">-</div></div>
+          <div class="runtime-item"><div class="runtime-label">当前任务</div><div class="runtime-value" id="runtimeTask">无</div></div>
+          <div class="runtime-item"><div class="runtime-label">最后连接时间</div><div class="runtime-value" id="runtimeLastConnected">无记录</div></div>
+          <div class="runtime-item"><div class="runtime-label">最近错误</div><div class="runtime-value" id="runtimeError">无</div></div>
+        </div>
+        <div class="runtime-actions">
+          <button id="reconnectBtn" class="secondary" type="button">重新连接</button>
+          <button id="clearLogsBtn" class="secondary" type="button">清空日志</button>
+        </div>
+        <div class="logs" id="runtimeLogs" aria-live="polite">暂无日志</div>
+      </section>
     </div>
   </div>
   <script src="options.js"></script>

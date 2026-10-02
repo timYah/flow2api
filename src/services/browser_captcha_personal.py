@@ -3,6 +3,8 @@
 使用 nodriver (undetected-chromedriver 继任者) 实现反检测浏览器
 支持常驻模式：维护全局共享的常驻标签页池，即时生成 token
 """
+from __future__ import annotations
+
 import asyncio
 import base64
 from collections import deque
@@ -297,6 +299,9 @@ def _cleanup_runtime_artifacts_sync(
 
 
 # ==================== nodriver 自动安装 ====================
+_NODRIVER_IMPORT_ERROR: Optional[BaseException] = None
+
+
 def _run_pip_install(package: str, use_mirror: bool = False) -> bool:
     """运行 pip install 命令
     
@@ -307,13 +312,22 @@ def _run_pip_install(package: str, use_mirror: bool = False) -> bool:
     Returns:
         是否安装成功
     """
-    cmd = [sys.executable, '-m', 'pip', 'install', package]
+    uv_binary = shutil.which("uv")
+    if uv_binary:
+        cmd = [uv_binary, "pip", "install", "--python", sys.executable, package]
+        installer_name = "uv"
+    else:
+        cmd = [sys.executable, '-m', 'pip', 'install', package]
+        installer_name = "pip（兼容回退）"
     if use_mirror:
-        cmd.extend(['-i', 'https://pypi.tuna.tsinghua.edu.cn/simple'])
+        cmd.extend([
+            '--default-index' if uv_binary else '-i',
+            'https://pypi.tuna.tsinghua.edu.cn/simple',
+        ])
     
     try:
-        debug_logger.log_info(f"[BrowserCaptcha] 正在安装 {package}...")
-        print(f"[BrowserCaptcha] 正在安装 {package}...")
+        debug_logger.log_info(f"[BrowserCaptcha] 正在使用 {installer_name} 安装 {package}...")
+        print(f"[BrowserCaptcha] 正在使用 {installer_name} 安装 {package}...")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode == 0:
             debug_logger.log_info(f"[BrowserCaptcha] ✅ {package} 安装成功")
@@ -333,12 +347,39 @@ def _ensure_nodriver_installed() -> bool:
     Returns:
         是否安装成功/已安装
     """
+    global _NODRIVER_IMPORT_ERROR
+
+    if sys.version_info < (3, 10):
+        debug_logger.log_error(
+            "[BrowserCaptcha] personal 模式需要 Python 3.10+，"
+            f"当前版本为 {sys.version_info.major}.{sys.version_info.minor}"
+        )
+        print(
+            "[BrowserCaptcha] ❌ personal 模式需要 Python 3.10+，"
+            f"当前版本为 {sys.version_info.major}.{sys.version_info.minor}"
+        )
+        return False
+
     try:
         import nodriver
         debug_logger.log_info("[BrowserCaptcha] nodriver 已安装")
         return True
     except ImportError:
         pass
+    except Exception as e:
+        _NODRIVER_IMPORT_ERROR = e
+        debug_logger.log_error(
+            "[BrowserCaptcha] nodriver 已安装但当前 Python 无法导入: "
+            f"{type(e).__name__}: {e}"
+        )
+        print(
+            "[BrowserCaptcha] ❌ nodriver 已安装但当前 Python 无法导入: "
+            f"{type(e).__name__}: {e}"
+        )
+        # An import-time compatibility error cannot be repaired by installing
+        # the same package again. Leave the application available so API-mode
+        # captcha can still be used and report the problem on browser use.
+        return False
     
     debug_logger.log_info("[BrowserCaptcha] nodriver 未安装，开始自动安装...")
     print("[BrowserCaptcha] nodriver 未安装，开始自动安装...")
@@ -353,8 +394,8 @@ def _ensure_nodriver_installed() -> bool:
     if _run_pip_install('nodriver', use_mirror=True):
         return True
     
-    debug_logger.log_error("[BrowserCaptcha] ❌ nodriver 自动安装失败，请手动安装: pip install nodriver")
-    print("[BrowserCaptcha] ❌ nodriver 自动安装失败，请手动安装: pip install nodriver")
+    debug_logger.log_error("[BrowserCaptcha] ❌ nodriver 自动安装失败，请执行: uv sync")
+    print("[BrowserCaptcha] ❌ nodriver 自动安装失败，请执行: uv sync")
     return False
 
 
@@ -703,9 +744,32 @@ else:
         try:
             import nodriver as uc
             NODRIVER_AVAILABLE = True
-        except ImportError as e:
+        except Exception as e:
+            _NODRIVER_IMPORT_ERROR = e
             debug_logger.log_error(f"[BrowserCaptcha] nodriver 导入失败: {e}")
             print(f"[BrowserCaptcha] ❌ nodriver 导入失败: {e}")
+
+
+def get_nodriver_unavailable_message() -> str:
+    """Return an actionable explanation when personal captcha is unavailable."""
+    if DOCKER_HEADED_BLOCKED:
+        return (
+            "检测到 Docker 环境，内置浏览器打码默认被禁用；"
+            "如需启用请设置 ALLOW_DOCKER_HEADED_CAPTCHA=true。"
+        )
+    if sys.version_info < (3, 10):
+        return (
+            "personal 浏览器打码需要 Python 3.10+，"
+            f"当前版本为 {sys.version_info.major}.{sys.version_info.minor}。"
+            "请使用 uv sync 创建项目环境。"
+        )
+    if _NODRIVER_IMPORT_ERROR is not None:
+        return (
+            "nodriver 已安装但当前 Python 无法导入 "
+            f"({type(_NODRIVER_IMPORT_ERROR).__name__}: {_NODRIVER_IMPORT_ERROR})。"
+            "请使用 Python 3.10+，然后执行 uv sync。"
+        )
+    return "nodriver 未安装或不可用，请执行 uv sync。"
 
 
 _RUNTIME_ERROR_KEYWORDS = (
@@ -866,7 +930,9 @@ def _patch_nodriver_connection_instance(connection_instance):
         from nodriver.core import connection as nodriver_connection_module
     except Exception as e:
         debug_logger.log_warning(f"[BrowserCaptcha] 加载 nodriver.connection 失败，跳过连接补丁: {e}")
-        return
+        # Keep the compatibility wrapper usable for diagnostics/tests even
+        # when nodriver itself cannot be imported on the current Python.
+        nodriver_connection_module = None
 
     class _CompatTransaction:
         def __init__(self, cdp_generator, tx_id: int):
@@ -907,6 +973,8 @@ def _patch_nodriver_connection_instance(connection_instance):
 
         tx_id = next(self.__count__)
         try:
+            if nodriver_connection_module is None:
+                raise ImportError("nodriver connection module unavailable")
             transaction = nodriver_connection_module.Transaction(cdp_obj)
             transaction.id = tx_id
         except Exception:
@@ -2265,10 +2333,7 @@ class BrowserCaptchaService:
                 "请设置 DISPLAY（例如 :99）并启动 Xorg/Xdummy 等虚拟显示。"
             )
         if not NODRIVER_AVAILABLE or uc is None:
-            raise RuntimeError(
-                "nodriver 未安装或不可用。"
-                "请手动安装: pip install nodriver"
-            )
+            raise RuntimeError(get_nodriver_unavailable_message())
 
     async def _run_with_timeout(self, awaitable, timeout_seconds: float, label: str):
         """统一收口 nodriver 操作超时，避免单次卡死拖住整条请求链路。"""
@@ -5357,6 +5422,85 @@ class BrowserCaptchaService:
         patchAnalyserMethod("getByteFrequencyData", Number(config.audio.byteDelta || 1));
         patchAnalyserMethod("getByteTimeDomainData", Number(config.audio.byteDelta || 1));
     }
+
+    // Flow2API Protection against Google Flow anti-extension honeypot (extension_hijack_detected)
+    try {
+        function patchFrontendConfig(mod) {
+            if (!mod || !mod.cG || !mod.cG.prototype) return;
+            try {
+                Object.defineProperty(mod.cG.prototype, 'Aa', {
+                    get: () => false,
+                    set: () => {},
+                    configurable: true,
+                    enumerable: true
+                });
+            } catch (e) {}
+            try {
+                Object.defineProperty(mod.cG.prototype, 'ma', {
+                    get: () => false,
+                    set: () => {},
+                    configurable: true,
+                    enumerable: true
+                });
+            } catch (e) {}
+        }
+        let _frontend = window.default_AiSandboxAngularFrontend;
+        if (_frontend) patchFrontendConfig(_frontend);
+        Object.defineProperty(window, 'default_AiSandboxAngularFrontend', {
+            configurable: true,
+            enumerable: true,
+            get: () => _frontend,
+            set: (val) => { _frontend = val; patchFrontendConfig(val); }
+        });
+
+        let _realExecute = null;
+        function protectEnterprise(enterprise) {
+            if (!enterprise || enterprise.__flow2api_hooked) return;
+            enterprise.__flow2api_hooked = true;
+            let _currentExecute = enterprise.execute;
+            if (typeof _currentExecute === 'function' && !_currentExecute.toString().includes('extension_hijack')) {
+                _realExecute = _currentExecute;
+            }
+            try {
+                Object.defineProperty(enterprise, 'execute', {
+                    configurable: true,
+                    enumerable: true,
+                    get: () => _realExecute || _currentExecute,
+                    set: (fn) => {
+                        if (typeof fn === 'function') {
+                            if (fn.toString().includes('extension_hijack')) return;
+                            _realExecute = fn;
+                            _currentExecute = fn;
+                        }
+                    }
+                });
+            } catch (e) {}
+        }
+        let _grecaptcha = window.grecaptcha;
+        if (_grecaptcha && _grecaptcha.enterprise) protectEnterprise(_grecaptcha.enterprise);
+        Object.defineProperty(window, 'grecaptcha', {
+            configurable: true,
+            enumerable: true,
+            get: () => _grecaptcha,
+            set: (val) => {
+                _grecaptcha = val;
+                if (val && typeof val === 'object') {
+                    if (val.enterprise) protectEnterprise(val.enterprise);
+                    else {
+                        let _ent = val.enterprise;
+                        try {
+                            Object.defineProperty(val, 'enterprise', {
+                                configurable: true,
+                                enumerable: true,
+                                get: () => _ent,
+                                set: (entVal) => { _ent = entVal; protectEnterprise(entVal); }
+                            });
+                        } catch (e) { protectEnterprise(val.enterprise); }
+                    }
+                }
+            }
+        });
+    } catch (e) {}
 })();
 """
             .replace("__MARKER_JSON__", json.dumps(PERSONAL_FINGERPRINT_SURFACE_SPOOF_MARKER))
@@ -10267,6 +10411,11 @@ class BrowserCaptchaService:
 
                             try {{
                                 grecaptcha.enterprise.ready(() => {{
+                                    if (typeof grecaptcha.enterprise.execute === 'function' && grecaptcha.enterprise.execute.toString().includes('extension_hijack')) {{
+                                        clearTimeout(timer);
+                                        done(reject, new Error('detected_extension_hijack_wrapper'));
+                                        return;
+                                    }}
                                     grecaptcha.enterprise.execute({json.dumps(self.website_key)}, {{action: {json.dumps(action)}}})
                                         .then((token) => {{
                                             clearTimeout(timer);

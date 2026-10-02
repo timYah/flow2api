@@ -1,0 +1,35 @@
+[project]
+name = "flow2api"
+version = "0.0.0"
+description = "OpenAI-compatible API service for Google Flow"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "aiosqlite==0.20.0",
+    "bcrypt==4.2.1",
+    "curl-cffi==0.7.3",
+    "fastapi==0.119.0",
+    "httpx>=0.27.0,<1.0.0",
+    "nodriver>=0.48.0; python_version >= '3.10'",
+    "pillow>=10.0.0",
+    "playwright>=1.40.0",
+    "prometheus-client==0.22.1",
+    "pydantic==2.10.4",
+    "python-dateutil==2.8.2",
+    "python-multipart==0.0.20",
+    "tomli==2.2.1",
+    "uvicorn[standard]==0.32.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv]
+# Flow2API is an application launched from the repository root, not a package
+# that needs to be installed into site-packages.
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

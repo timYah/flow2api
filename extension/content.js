@@ -6,6 +6,37 @@ function getRecaptchaToken(action) {
         const script = document.createElement("script");
         script.textContent = `
             try {
+                // 防护 Google Flow 反插件劫持
+                try {
+                    const origAssign = Object.assign;
+                    if (!Object.__flow2api_assign_hooked) {
+                        Object.assign = function(target, ...sources) {
+                            const cleaned = sources.map(src => {
+                                if (src && typeof src === 'object' && src.action === 'extension_hijack_detected') {
+                                    const copy = origAssign({}, src);
+                                    delete copy.action;
+                                    return copy;
+                                }
+                                return src;
+                            });
+                            return origAssign.apply(Object, [target, ...cleaned]);
+                        };
+                        Object.__flow2api_assign_hooked = true;
+                    }
+                } catch(e) {}
+
+                try {
+                    const mod = window.default_AiSandboxAngularFrontend;
+                    if (mod && mod.cG && mod.cG.prototype) {
+                        Object.defineProperty(mod.cG.prototype, 'Aa', {
+                            get: () => false,
+                            set: () => {},
+                            configurable: true,
+                            enumerable: true
+                        });
+                    }
+                } catch(e) {}
+
                 function runCaptcha() {
                     grecaptcha.enterprise.ready(function() {
                         grecaptcha.enterprise.execute('6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV', {action: '${action}'})

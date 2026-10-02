@@ -6,6 +6,7 @@ import os
 import sys
 import subprocess
 import signal
+import shutil
 # 修复 Windows 上 playwright 的 asyncio 兼容性问题
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
 
@@ -71,15 +72,24 @@ BROWSER_ENVIRONMENT_PATCH_MARKER = "__flow2apiBrowserEnvironmentPatchInstalled__
 
 # ==================== playwright 自动安装 ====================
 def _run_pip_install(package: str, use_mirror: bool = False) -> bool:
-    """运行 pip install 命令"""
-    cmd = [sys.executable, '-m', 'pip', 'install', package]
+    """Install a missing runtime package, preferring uv for this project."""
+    uv_binary = shutil.which("uv")
+    if uv_binary:
+        cmd = [uv_binary, "pip", "install", "--python", sys.executable, package]
+        installer_name = "uv"
+    else:
+        cmd = [sys.executable, '-m', 'pip', 'install', package]
+        installer_name = "pip（兼容回退）"
     if use_mirror:
-        cmd.extend(['-i', 'https://pypi.tuna.tsinghua.edu.cn/simple'])
+        cmd.extend([
+            '--default-index' if uv_binary else '-i',
+            'https://pypi.tuna.tsinghua.edu.cn/simple',
+        ])
     
     try:
-        debug_logger.log_info(f"[BrowserCaptcha] 正在安装 {package}...")
-        progress_runtime_prepare("browser", f"[BrowserCaptcha] 正在安装 {package}...")
-        print(f"[BrowserCaptcha] 正在安装 {package}...")
+        debug_logger.log_info(f"[BrowserCaptcha] 正在使用 {installer_name} 安装 {package}...")
+        progress_runtime_prepare("browser", f"[BrowserCaptcha] 正在使用 {installer_name} 安装 {package}...")
+        print(f"[BrowserCaptcha] 正在使用 {installer_name} 安装 {package}...")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode == 0:
             debug_logger.log_info(f"[BrowserCaptcha] ✅ {package} 安装成功")
@@ -148,9 +158,9 @@ def _ensure_playwright_installed() -> bool:
     if _run_pip_install('playwright', use_mirror=True):
         return True
     
-    debug_logger.log_error("[BrowserCaptcha] ❌ playwright 自动安装失败，请手动安装: pip install playwright")
-    fail_runtime_prepare("browser", "[BrowserCaptcha] ❌ playwright 自动安装失败，请手动安装: pip install playwright")
-    print("[BrowserCaptcha] ❌ playwright 自动安装失败，请手动安装: pip install playwright")
+    debug_logger.log_error("[BrowserCaptcha] ❌ playwright 自动安装失败，请执行: uv sync")
+    fail_runtime_prepare("browser", "[BrowserCaptcha] ❌ playwright 自动安装失败，请执行: uv sync")
+    print("[BrowserCaptcha] ❌ playwright 自动安装失败，请执行: uv sync")
     return False
 
 
@@ -195,9 +205,9 @@ def _ensure_browser_installed() -> bool:
     if _run_playwright_install(use_mirror=True):
         return True
     
-    debug_logger.log_error("[BrowserCaptcha] ❌ chromium 浏览器自动安装失败，请手动安装: python -m playwright install chromium")
-    fail_runtime_prepare("browser", "[BrowserCaptcha] ❌ chromium 浏览器自动安装失败，请手动安装: python -m playwright install chromium")
-    print("[BrowserCaptcha] ❌ chromium 浏览器自动安装失败，请手动安装: python -m playwright install chromium")
+    debug_logger.log_error("[BrowserCaptcha] ❌ chromium 浏览器自动安装失败，请执行: uv run python -m playwright install chromium")
+    fail_runtime_prepare("browser", "[BrowserCaptcha] ❌ chromium 浏览器自动安装失败，请执行: uv run python -m playwright install chromium")
+    print("[BrowserCaptcha] ❌ chromium 浏览器自动安装失败，请执行: uv run python -m playwright install chromium")
     return False
 
 
@@ -226,7 +236,7 @@ else:
             PLAYWRIGHT_AVAILABLE = True
             # 检查并安装浏览器
             _ensure_browser_installed()
-        except ImportError as e:
+        except Exception as e:
             debug_logger.log_error(f"[BrowserCaptcha] playwright 导入失败: {e}")
             print(f"[BrowserCaptcha] ❌ playwright 导入失败: {e}")
 
@@ -238,6 +248,55 @@ BROWSER_SESSION_COOKIE_TARGET_URLS = (
     "https://www.google.com/",
     "https://www.recaptcha.net/",
 )
+
+
+def _normalize_account_token_id(token_id: Optional[int]) -> int:
+    """Normalize and validate the token id used as an account profile key."""
+    if isinstance(token_id, bool):
+        raise ValueError("token_id must be a positive integer")
+    try:
+        normalized = int(token_id)
+    except (TypeError, ValueError):
+        raise ValueError("token_id must be a positive integer") from None
+    if normalized <= 0:
+        raise ValueError("token_id must be a positive integer")
+    return normalized
+
+
+def get_account_browser_profile_dir(
+    token_id: int,
+    base_user_data_dir: Optional[str] = None,
+) -> str:
+    """Return the exact on-disk profile directory for one account."""
+    normalized_token_id = _normalize_account_token_id(token_id)
+    base_dir = base_user_data_dir or os.path.join(os.getcwd(), "browser_data_rt")
+    accounts_root = os.path.abspath(os.path.join(base_dir, "accounts"))
+    profile_dir = os.path.abspath(
+        os.path.join(accounts_root, f"token_{normalized_token_id}")
+    )
+    # Keep this guard close to the path construction so a future change to
+    # the token-id format cannot turn cleanup into a broad recursive delete.
+    if os.path.dirname(profile_dir) != accounts_root:
+        raise ValueError("invalid account browser profile path")
+    return profile_dir
+
+
+def delete_account_browser_profile(
+    token_id: int,
+    base_user_data_dir: Optional[str] = None,
+) -> bool:
+    """Delete one account profile without touching sibling profiles."""
+    profile_dir = get_account_browser_profile_dir(token_id, base_user_data_dir)
+    if not os.path.lexists(profile_dir):
+        return False
+    if os.path.islink(profile_dir):
+        # Never follow a symlink during profile cleanup.
+        os.unlink(profile_dir)
+        return True
+    if not os.path.isdir(profile_dir):
+        raise RuntimeError(f"account browser profile is not a directory: {profile_dir}")
+    shutil.rmtree(profile_dir)
+    return True
 
 # ==========================================
 # 代理解析工具函数
@@ -300,10 +359,7 @@ def validate_browser_proxy_url(proxy_url: str) -> tuple[bool, str]:
     return True, None
 
 class TokenBrowser:
-    """简化版浏览器：每次获取 token 时启动新浏览器，用完即关
-    
-    每次都是新的随机 UA，避免长时间运行导致的各种问题
-    """
+    """One account's headed browser context and persisted Chrome profile."""
     # UA pool updated on 2026-03-01 from browsers that scored >= 0.3.
     UA_LIST = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
@@ -398,11 +454,12 @@ class TokenBrowser:
         (3200, 1800), (2304, 1440), (1800, 1200),
     ]
     
-    def __init__(self, token_id: int, user_data_dir: str, db=None):
+    def __init__(self, token_id: int, user_data_dir: str, db=None, persistent_profile: bool = True):
         self.token_id = token_id
         self.user_data_dir = user_data_dir
         self.db = db
-        self._semaphore = asyncio.Semaphore(1)  # Only one active solve task is allowed per slot.
+        self._persistent_profile = bool(persistent_profile)
+        self._semaphore = asyncio.Semaphore(1)  # One active solve task is allowed per account.
         self._solve_count = 0
         self._error_count = 0
         self._last_fingerprint: Optional[Dict[str, Any]] = None
@@ -410,17 +467,19 @@ class TokenBrowser:
         # Delay browser release after solve and track it by request_ref.
         self._pending_release_entries: Dict[str, Dict[str, Any]] = {}
         self._pending_release_lock = asyncio.Lock()
-        # Browser mode keeps a shared in-memory browser instead of a persistent profile.
+        # The account context stays alive between solves and is closed by the
+        # idle reaper or account/profile cleanup.
         self._shared_browser_lock = asyncio.Lock()
         self._shared_playwright = None
         self._shared_browser = None
         self._shared_context = None
+        self._shared_context_is_persistent = False
         self._shared_keepalive_page = None
         self._shared_browser_pid: Optional[int] = None
         self._shared_bound_token_id: Optional[int] = None
         self._shared_bound_cookie_signature: Optional[str] = None
         self._pid_dir = os.path.join(os.getcwd(), "tmp", "browser_pids")
-        self._pid_file = os.path.join(self._pid_dir, f"slot_{self.token_id}.pid")
+        self._pid_file = os.path.join(self._pid_dir, f"account_{self.token_id}.pid")
         os.makedirs(self._pid_dir, exist_ok=True)
         self._shared_proxy_url: Optional[str] = None
         self._shared_launch_count = 0
@@ -842,6 +901,85 @@ class TokenBrowser:
             makeNative(AudioBuffer.prototype.getChannelData, "getChannelData");
         }
     } catch (e) {}
+
+    // Flow2API Protection against Google Flow anti-extension honeypot (extension_hijack_detected)
+    try {
+        function patchFrontendConfig(mod) {
+            if (!mod || !mod.cG || !mod.cG.prototype) return;
+            try {
+                Object.defineProperty(mod.cG.prototype, 'Aa', {
+                    get: () => false,
+                    set: () => {},
+                    configurable: true,
+                    enumerable: true
+                });
+            } catch (e) {}
+            try {
+                Object.defineProperty(mod.cG.prototype, 'ma', {
+                    get: () => false,
+                    set: () => {},
+                    configurable: true,
+                    enumerable: true
+                });
+            } catch (e) {}
+        }
+        let _frontend = window.default_AiSandboxAngularFrontend;
+        if (_frontend) patchFrontendConfig(_frontend);
+        Object.defineProperty(window, 'default_AiSandboxAngularFrontend', {
+            configurable: true,
+            enumerable: true,
+            get: () => _frontend,
+            set: (val) => { _frontend = val; patchFrontendConfig(val); }
+        });
+
+        let _realExecute = null;
+        function protectEnterprise(enterprise) {
+            if (!enterprise || enterprise.__flow2api_hooked) return;
+            enterprise.__flow2api_hooked = true;
+            let _currentExecute = enterprise.execute;
+            if (typeof _currentExecute === 'function' && !_currentExecute.toString().includes('extension_hijack')) {
+                _realExecute = _currentExecute;
+            }
+            try {
+                Object.defineProperty(enterprise, 'execute', {
+                    configurable: true,
+                    enumerable: true,
+                    get: () => _realExecute || _currentExecute,
+                    set: (fn) => {
+                        if (typeof fn === 'function') {
+                            if (fn.toString().includes('extension_hijack')) return;
+                            _realExecute = fn;
+                            _currentExecute = fn;
+                        }
+                    }
+                });
+            } catch (e) {}
+        }
+        let _grecaptcha = window.grecaptcha;
+        if (_grecaptcha && _grecaptcha.enterprise) protectEnterprise(_grecaptcha.enterprise);
+        Object.defineProperty(window, 'grecaptcha', {
+            configurable: true,
+            enumerable: true,
+            get: () => _grecaptcha,
+            set: (val) => {
+                _grecaptcha = val;
+                if (val && typeof val === 'object') {
+                    if (val.enterprise) protectEnterprise(val.enterprise);
+                    else {
+                        let _ent = val.enterprise;
+                        try {
+                            Object.defineProperty(val, 'enterprise', {
+                                configurable: true,
+                                enumerable: true,
+                                get: () => _ent,
+                                set: (entVal) => { _ent = entVal; protectEnterprise(entVal); }
+                            });
+                        } catch (e) { protectEnterprise(val.enterprise); }
+                    }
+                }
+            }
+        });
+    } catch (e) {}
 })();
 """
             .replace("__MARKER_JSON__", json.dumps(BROWSER_ENVIRONMENT_PATCH_MARKER))
@@ -873,8 +1011,14 @@ class TokenBrowser:
             )
             return False
 
+    def _get_account_marker(self) -> str:
+        return f"--flow2api-browser-account={self.token_id}"
+
+    # Keep the old method name for callers from older integrations.  The
+    # marker itself is account-scoped so a stale slot process can never be
+    # mistaken for the current account process.
     def _get_slot_marker(self) -> str:
-        return f"--flow2api-browser-slot={self.token_id}"
+        return self._get_account_marker()
 
     def _read_pid_file(self) -> Optional[int]:
         try:
@@ -917,7 +1061,7 @@ class TokenBrowser:
     def _pid_matches_slot(self, pid: Optional[int]) -> bool:
         if not pid:
             return False
-        marker = self._get_slot_marker()
+        marker = self._get_account_marker()
         try:
             if sys.platform.startswith('win'):
                 result = subprocess.run(
@@ -971,7 +1115,7 @@ class TokenBrowser:
         except Exception as e:
             debug_logger.log_warning(f"[BrowserCaptcha] Token-{self.token_id} failed to kill PID={pid}: {e}")
 
-    async def _cleanup_stale_slot_process(self):
+    async def _cleanup_stale_account_process(self):
         stale_pid = self._read_pid_file()
         if not stale_pid:
             return
@@ -984,9 +1128,13 @@ class TokenBrowser:
             )
             self._write_pid_file(None)
             return
-        self._kill_pid(stale_pid, reason='stale_slot_process')
+        self._kill_pid(stale_pid, reason='stale_account_process')
         await self._wait_pid_exit(stale_pid, timeout_seconds=3)
         self._write_pid_file(None)
+
+    async def _cleanup_stale_slot_process(self):
+        """Backward-compatible alias for the account-scoped PID cleanup."""
+        await self._cleanup_stale_account_process()
 
     def _extract_browser_pid(self, browser) -> Optional[int]:
         candidates = [
@@ -1106,7 +1254,9 @@ class TokenBrowser:
             return False
 
         try:
-            await context.clear_cookies()
+            # Persistent account contexts already contain the account's other
+            # cookies and local storage.  Replace only the session cookie
+            # targets so refreshing an ST cannot wipe unrelated browser state.
             await context.add_cookies(browser_cookies)
             self._shared_bound_token_id = token_key
             self._shared_bound_cookie_signature = cookie_signature
@@ -1266,15 +1416,30 @@ class TokenBrowser:
 
         return proxy_option, raw_proxy_url, proxy_source
 
-    async def _create_browser(self, token_proxy_url: Optional[str] = None, manage_slot_pid: bool = True) -> tuple:
-        """Create a browser instance; shared-slot browsers track PIDs while temporary browsers do not."""
+    async def _create_browser(
+        self,
+        token_proxy_url: Optional[str] = None,
+        manage_slot_pid: bool = True,
+        persistent_profile: Optional[bool] = None,
+    ) -> tuple:
+        """Create a browser context.
+
+        Account browsers use Playwright's persistent context API and keep
+        their data in ``user_data_dir``.  Management/diagnostic flows opt out
+        explicitly and continue to use an in-memory temporary context.
+        """
+        use_persistent_profile = (
+            (self._persistent_profile and manage_slot_pid)
+            if persistent_profile is None
+            else bool(persistent_profile)
+        )
         width = self._profile_viewport["width"]
         height = self._profile_viewport["height"]
         viewport = {"width": width, "height": height}
         launch_in_background = bool(getattr(config, "browser_launch_background", True))
 
         if manage_slot_pid:
-            await self._cleanup_stale_slot_process()
+            await self._cleanup_stale_account_process()
         playwright = await async_playwright().start()
         browser_executable_path = os.environ.get("BROWSER_EXECUTABLE_PATH", "").strip() or None
         proxy_option, raw_proxy_url, _ = await self._resolve_proxy_runtime_config(token_proxy_url=token_proxy_url)
@@ -1284,6 +1449,8 @@ class TokenBrowser:
             "proxy_url": raw_proxy_url if raw_proxy_url else None,
         }
 
+        browser = None
+        context = None
         try:
             browser_args = [
                 '--disable-blink-features=AutomationControlled',
@@ -1298,7 +1465,6 @@ class TokenBrowser:
                 f'--window-size={width},{height}',
                 '--disable-infobars',
                 '--hide-scrollbars',
-                '--profile-directory=Default',
                 '--disable-extensions',
                 '--disable-background-networking',
                 '--disable-sync',
@@ -1307,13 +1473,15 @@ class TokenBrowser:
                 '--no-default-browser-check',
             ]
 
+            if manage_slot_pid:
+                browser_args.append(self._get_account_marker())
+
             if launch_in_background:
                 browser_args.extend([
                     '--start-minimized',
                     '--disable-background-timer-throttling',
                     '--disable-renderer-backgrounding',
                     '--disable-backgrounding-occluded-windows',
-                    f'--flow2api-browser-slot={self.token_id}',
                 ])
                 if sys.platform.startswith("win"):
                     browser_args.append('--window-position=-32000,-32000')
@@ -1326,26 +1494,58 @@ class TokenBrowser:
                     f"[BrowserCaptcha] Token-{self.token_id} using custom browser executable: {browser_executable_path}"
                 )
 
-            browser = await playwright.chromium.launch(
-                headless=False,
-                executable_path=browser_executable_path,
-                proxy=proxy_option,
-                args=browser_args,
-            )
-            context = await browser.new_context(
-                viewport=viewport,
-                locale="en-US",
-            )
+            if use_persistent_profile:
+                os.makedirs(self.user_data_dir, exist_ok=True)
+                context = await playwright.chromium.launch_persistent_context(
+                    user_data_dir=self.user_data_dir,
+                    headless=False,
+                    executable_path=browser_executable_path,
+                    proxy=proxy_option,
+                    args=browser_args,
+                    viewport=viewport,
+                    locale="en-US",
+                )
+                # Persistent contexts own the browser process.  Playwright
+                # exposes it through context.browser when available, but the
+                # context remains the authoritative object to close.
+                browser = getattr(context, "browser", None)
+            else:
+                browser = await playwright.chromium.launch(
+                    headless=False,
+                    executable_path=browser_executable_path,
+                    proxy=proxy_option,
+                    args=browser_args,
+                )
+                context = await browser.new_context(
+                    viewport=viewport,
+                    locale="en-US",
+                )
+            try:
+                context._flow2api_persistent_context = use_persistent_profile
+            except Exception:
+                pass
             await self._apply_browser_environment_patch(context, label="context")
-            browser_pid = self._extract_browser_pid(browser)
+            browser_pid = self._extract_browser_pid(browser or getattr(context, "browser", None))
             if manage_slot_pid:
                 self._write_pid_file(browser_pid)
             debug_logger.log_info(
-                f"[BrowserCaptcha] Token-{self.token_id} shared browser started (proxy={'yes' if raw_proxy_url else 'no'})"
+                f"[BrowserCaptcha] Token-{self.token_id} account browser started "
+                f"(persistent={'yes' if use_persistent_profile else 'no'}, "
+                f"proxy={'yes' if raw_proxy_url else 'no'})"
             )
             return playwright, browser, context
         except Exception as e:
             debug_logger.log_error(f"[BrowserCaptcha] Token-{self.token_id} browser launch failed: {type(e).__name__}: {str(e)[:200]}")
+            try:
+                if context:
+                    await context.close()
+            except Exception:
+                pass
+            try:
+                if browser and not use_persistent_profile:
+                    await browser.close()
+            except Exception:
+                pass
             try:
                 if playwright:
                     await playwright.stop()
@@ -1361,12 +1561,14 @@ class TokenBrowser:
         browser = self._shared_browser
         context = self._shared_context
         keepalive_page = self._shared_keepalive_page
+        persistent_context = self._shared_context_is_persistent
         browser_pid = self._shared_browser_pid or self._read_pid_file()
         had_browser = bool(playwright or browser or context or keepalive_page or browser_pid)
 
         self._shared_playwright = None
         self._shared_browser = None
         self._shared_context = None
+        self._shared_context_is_persistent = False
         self._shared_keepalive_page = None
         self._shared_browser_pid = None
         self._shared_proxy_url = None
@@ -1382,7 +1584,26 @@ class TokenBrowser:
             debug_logger.log_info(
                 f"[BrowserCaptcha] Token-{self.token_id} shared browser recycled, reason={reason}"
             )
-        await self._close_browser(playwright, browser, context, browser_pid=browser_pid)
+        close_task = asyncio.create_task(
+            self._close_browser(
+                playwright,
+                browser,
+                context,
+                browser_pid=browser_pid,
+                persistent_context=persistent_context,
+            )
+        )
+        try:
+            # The references above are cleared before closing so another
+            # request cannot reuse a context that is being recycled.  Shield
+            # the actual close to avoid task cancellation orphaning that
+            # context after its references have been detached.
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            try:
+                await close_task
+            finally:
+                raise
 
     async def recycle_browser(self, reason: str = "unknown", rotate_profile: bool = True):
         """Recycle the current shared browser."""
@@ -1394,17 +1615,18 @@ class TokenBrowser:
         token_proxy_url: Optional[str] = None,
         token_id: Optional[int] = None,
     ) -> tuple:
-        """Get or create the shared browser for this slot."""
+        """Get or create the shared browser for this account."""
         _, expected_proxy_url, _ = await self._resolve_proxy_runtime_config(token_proxy_url=token_proxy_url)
         expected_token_key = self._normalize_token_key(token_id)
 
         async with self._shared_browser_lock:
-            has_shared_browser = bool(self._shared_playwright and self._shared_browser and self._shared_context)
+            has_shared_browser = bool(self._shared_playwright and self._shared_context)
 
             if has_shared_browser:
                 is_connected = True
                 try:
-                    checker = getattr(self._shared_browser, "is_connected", None)
+                    browser_for_check = self._shared_browser or getattr(self._shared_context, "browser", None)
+                    checker = getattr(browser_for_check, "is_connected", None)
                     if callable(checker):
                         is_connected = bool(checker())
                 except Exception:
@@ -1415,7 +1637,8 @@ class TokenBrowser:
                     has_shared_browser = False
 
             if has_shared_browser and self._shared_proxy_url != expected_proxy_url:
-                # If the proxy configuration changed, recycle the slot before reusing it.
+                # If the proxy configuration changed, recycle the account
+                # context before reusing it.
                 await self._recycle_browser_locked(reason="proxy_changed", rotate_profile=False)
                 has_shared_browser = False
 
@@ -1452,21 +1675,35 @@ class TokenBrowser:
                 )
                 return self._shared_playwright, self._shared_browser, self._shared_context
 
-            playwright, browser, context = await self._create_browser(token_proxy_url=token_proxy_url)
+            playwright, browser, context = await self._create_browser(
+                token_proxy_url=token_proxy_url,
+                persistent_profile=self._persistent_profile,
+            )
             binding_ok = await self._ensure_shared_token_binding(context, token_id)
             if not binding_ok:
                 await self._close_browser(
                     playwright,
                     browser,
                     context,
-                    browser_pid=self._extract_browser_pid(browser),
+                    browser_pid=self._extract_browser_pid(browser or getattr(context, "browser", None)),
                     clear_slot_pid=True,
+                    persistent_context=self._persistent_profile,
                 )
                 raise RuntimeError("failed to bind token session context")
             self._shared_playwright = playwright
             self._shared_browser = browser
             self._shared_context = context
-            await self._ensure_shared_keepalive_page()
+            self._shared_context_is_persistent = self._persistent_profile
+            try:
+                await self._ensure_shared_keepalive_page()
+            except Exception:
+                # Do not leave a half-initialized persistent context in the
+                # account map if the keepalive page cannot be created.
+                await self._recycle_browser_locked(
+                    reason="keepalive_page_start_failed",
+                    rotate_profile=False,
+                )
+                raise
             self._shared_proxy_url = (self._last_fingerprint or {}).get("proxy_url")
             self._shared_launch_count += 1
             self._shared_reuse_count = 0
@@ -1651,20 +1888,33 @@ class TokenBrowser:
         context,
         browser_pid: Optional[int] = None,
         clear_slot_pid: bool = True,
+        persistent_context: Optional[bool] = None,
     ):
-        """Close a browser instance and fall back to PID cleanup if needed."""
+        """Close a browser instance and fall back to PID cleanup if needed.
+
+        A persistent context owns its browser process, so closing the context
+        and stopping Playwright is sufficient.  Calling ``browser.close`` on
+        the same persistent browser can race with context shutdown.
+        """
+        if persistent_context is None:
+            persistent_context = bool(
+                context is not None
+                and getattr(context, "_flow2api_persistent_context", False)
+            )
         is_shared_browser = any([
             context is not None and context is self._shared_context,
             browser is not None and browser is self._shared_browser,
             playwright is not None and playwright is self._shared_playwright,
         ])
-        effective_pid = browser_pid or self._extract_browser_pid(browser)
+        browser_for_pid = browser or getattr(context, "browser", None)
+        effective_pid = browser_pid or self._extract_browser_pid(browser_for_pid)
         if clear_slot_pid and not effective_pid:
             effective_pid = self._shared_browser_pid or self._read_pid_file()
         if is_shared_browser:
             self._shared_playwright = None
             self._shared_browser = None
             self._shared_context = None
+            self._shared_context_is_persistent = False
             self._shared_keepalive_page = None
             self._shared_browser_pid = None
             self._shared_proxy_url = None
@@ -1676,7 +1926,7 @@ class TokenBrowser:
         except Exception:
             pass
         try:
-            if browser:
+            if browser and not persistent_context:
                 await asyncio.wait_for(browser.close(), timeout=10)
         except Exception:
             pass
@@ -1690,6 +1940,19 @@ class TokenBrowser:
             await self._wait_pid_exit(effective_pid, timeout_seconds=2)
         if clear_slot_pid:
             self._write_pid_file(None)
+
+    async def wait_until_idle(self, timeout_seconds: Optional[float] = None) -> bool:
+        """Wait until no solve is using this account browser."""
+        async def _wait():
+            async with self._semaphore:
+                return True
+
+        try:
+            if timeout_seconds is None:
+                return await _wait()
+            return await asyncio.wait_for(_wait(), timeout=max(0.0, float(timeout_seconds)))
+        except asyncio.TimeoutError:
+            return False
 
     async def _wait_and_close_after_request(
         self,
@@ -2072,7 +2335,7 @@ class TokenBrowser:
         return max(0.0, time.monotonic() - self._last_idle_since)
 
     def has_shared_browser(self) -> bool:
-        return bool(self._shared_browser or self._shared_context or self._shared_keepalive_page)
+        return bool(self._shared_playwright and self._shared_context)
 
     def get_last_fingerprint(self) -> Optional[Dict[str, Any]]:
         """返回最近一次打码浏览器的指纹快照。"""
@@ -2211,6 +2474,11 @@ class TokenBrowser:
                                     const solveToken = () => new Promise((resolve, reject) => {
                                         const timer = setTimeout(() => reject(new Error('captcha_timeout')), 25000);
                                         try {
+                                            if (typeof grecaptcha.enterprise.execute === 'function' && grecaptcha.enterprise.execute.toString().includes('extension_hijack')) {
+                                                clearTimeout(timer);
+                                                reject(new Error('detected_extension_hijack_wrapper'));
+                                                return;
+                                            }
                                             grecaptcha.enterprise.execute(websiteKey, { action: actionName })
                                                 .then((token) => {
                                                     clearTimeout(timer);
@@ -2424,7 +2692,10 @@ class TokenBrowser:
                     context = None
                     try:
                         start_ts = time.time()
-                        playwright, browser, context = await self._create_browser(manage_slot_pid=False)
+                        playwright, browser, context = await self._create_browser(
+                            manage_slot_pid=False,
+                            persistent_profile=False,
+                        )
                         token = await self._execute_custom_captcha(
                             context=context,
                             website_url=website_url,
@@ -2486,7 +2757,10 @@ class TokenBrowser:
                     context = None
                     try:
                         started_at = time.time()
-                        playwright, browser, context = await self._create_browser(manage_slot_pid=False)
+                        playwright, browser, context = await self._create_browser(
+                            manage_slot_pid=False,
+                            persistent_profile=False,
+                        )
                         payload = await self._execute_custom_captcha(
                             context=context,
                             website_url=website_url,
@@ -2538,38 +2812,51 @@ class TokenBrowser:
 
 
 class BrowserCaptchaService:
-    """多浏览器轮询打码服务（单例模式）
-    
-    支持配置浏览器数量，每个浏览器只开 1 个标签页，请求轮询分配
+    """Account-scoped headed browser captcha service.
+
+    ``browser_count`` limits the number of live persistent contexts, while
+    ``_browsers`` keeps lightweight account objects so evicted contexts can be
+    recreated with the same on-disk profile later.
     """
-    
+
     _instance: Optional['BrowserCaptchaService'] = None
     _lock = asyncio.Lock()
-    
+
     def __init__(self, db=None):
         self.db = db
         self.website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
         self.base_user_data_dir = os.path.join(os.getcwd(), "browser_data_rt")
+        self.accounts_user_data_dir = os.path.join(self.base_user_data_dir, "accounts")
+
+        # Keyed by stable database token id, never by a reusable slot number.
         self._browsers: Dict[int, TokenBrowser] = {}
         self._browsers_lock = asyncio.Lock()
-        self._slot_allocation_lock = asyncio.Lock()
-        self._slot_reservations: Dict[int, int] = {}
-        
-        # ???????
-        self._browser_count = 1  # ?? 1 ?????????
-        self._round_robin_index = 0  # ????
-        # ????
+        self._capacity_condition = asyncio.Condition(self._browsers_lock)
+        self._account_reservations: Dict[int, int] = {}
+        self._pending_context_evictions: set[int] = set()
+        self._removing_token_ids: set[int] = set()
+
+        # Compatibility aliases for older diagnostic integrations.
+        self._slot_allocation_lock = self._browsers_lock
+        self._slot_reservations = self._account_reservations
+
+        self._browser_count = 1
+        self._diagnostic_sequence = 0
+        self._diagnostic_browsers: Dict[int, TokenBrowser] = {}
         self._stats = {
             "req_total": 0,
             "gen_ok": 0,
             "gen_fail": 0,
-            "api_403": 0
+            "api_403": 0,
         }
-        
-        # ?????? _load_browser_count ???????
-        self._token_semaphore = None
+        # Diagnostic score/token checks use temporary contexts and are kept
+        # behind their own process-start limiter.  Account context capacity is
+        # coordinated by _capacity_condition instead.
+        self._diagnostic_semaphore: Optional[asyncio.Semaphore] = asyncio.Semaphore(1)
+        # Keep the old attribute for integrations that only inspect it.
+        self._token_semaphore = self._diagnostic_semaphore
         self._idle_reaper_task: Optional[asyncio.Task] = None
-    
+
     async def _ensure_idle_reaper(self):
         if self._idle_reaper_task is None or self._idle_reaper_task.done():
             self._idle_reaper_task = asyncio.create_task(self._idle_reaper_loop())
@@ -2579,20 +2866,32 @@ class BrowserCaptchaService:
             try:
                 await asyncio.sleep(15)
                 idle_ttl = int(getattr(config, "browser_idle_ttl_seconds", 600) or 600)
-                browsers = []
-                async with self._browsers_lock:
-                    browsers = list(self._browsers.values())
-                for browser in browsers:
+                async with self._capacity_condition:
+                    candidates = [
+                        browser
+                        for token_id, browser in self._browsers.items()
+                        if token_id not in self._pending_context_evictions
+                        and token_id not in self._removing_token_ids
+                        and self._account_reservations.get(token_id, 0) == 0
+                        and browser.has_shared_browser()
+                        and not browser.is_busy()
+                        and browser.idle_seconds() >= idle_ttl
+                    ]
+                    for browser in candidates:
+                        self._pending_context_evictions.add(browser.token_id)
+
+                for browser in candidates:
                     try:
-                        if browser.is_busy():
-                            continue
-                        if not browser.has_shared_browser():
-                            continue
-                        if browser.idle_seconds() < idle_ttl:
-                            continue
-                        await browser.recycle_browser(reason=f"idle_ttl_{idle_ttl}s", rotate_profile=False)
+                        await browser.recycle_browser(
+                            reason=f"idle_ttl_{idle_ttl}s",
+                            rotate_profile=False,
+                        )
                     except Exception as e:
                         debug_logger.log_warning(f"[BrowserCaptcha] idle reaper failed: {e}")
+                    finally:
+                        async with self._capacity_condition:
+                            self._pending_context_evictions.discard(browser.token_id)
+                            self._capacity_condition.notify_all()
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -2604,11 +2903,10 @@ class BrowserCaptchaService:
             async with cls._lock:
                 if cls._instance is None:
                     cls._instance = cls(db)
-                    # 从数据库加载 browser_count 配置
                     await cls._instance._load_browser_count()
                     await cls._instance._ensure_idle_reaper()
         return cls._instance
-    
+
     def _check_available(self):
         """检查服务是否可用"""
         if DOCKER_HEADED_BLOCKED:
@@ -2624,176 +2922,357 @@ class BrowserCaptchaService:
         if not PLAYWRIGHT_AVAILABLE or async_playwright is None:
             raise RuntimeError(
                 "playwright 未安装或不可用。"
-                "请手动安装: pip install playwright && python -m playwright install chromium"
+                "请执行: uv sync && uv run python -m playwright install chromium"
             )
-    
+
     async def _load_browser_count(self):
-        """从数据库加载浏览器数量配置"""
+        """Load the maximum number of simultaneously live account contexts."""
+        browser_count = 1
         if self.db:
             try:
                 captcha_config = await self.db.get_captcha_config()
-                self._browser_count = max(1, captcha_config.browser_count)
-                debug_logger.log_info(f"[BrowserCaptcha] 浏览器数量配置: {self._browser_count}")
+                browser_count = int(getattr(captcha_config, "browser_count", 1) or 1)
             except Exception as e:
-                debug_logger.log_warning(f"[BrowserCaptcha] 加载 browser_count 配置失败: {e}，使用默认值 1")
-                self._browser_count = 1
-        # 并发限制 = 浏览器数量，不再硬编码限制
-        self._token_semaphore = asyncio.Semaphore(self._browser_count)
-        debug_logger.log_info(f"[BrowserCaptcha] 并发上限: {self._browser_count}")
-    
-    async def reload_browser_count(self):
-        """???????????????????????"""
-        old_count = self._browser_count
-        await self._load_browser_count()
-        
-        browsers_to_close: List[TokenBrowser] = []
-        await self._ensure_idle_reaper()
-        if self._browser_count < old_count:
-            async with self._browsers_lock:
-                for browser_id in list(self._browsers.keys()):
-                    if browser_id >= self._browser_count:
-                        browsers_to_close.append(self._browsers.pop(browser_id))
-                        debug_logger.log_info(f"[BrowserCaptcha] ????????? {browser_id}")
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] 加载 browser_count 配置失败: {e}，使用默认值 1"
+                )
+        self._browser_count = max(1, min(20, browser_count))
+        self._diagnostic_semaphore = asyncio.Semaphore(self._browser_count)
+        self._token_semaphore = self._diagnostic_semaphore
+        async with self._capacity_condition:
+            self._capacity_condition.notify_all()
+        debug_logger.log_info(
+            f"[BrowserCaptcha] 账户浏览器 context 并发上限: {self._browser_count}"
+        )
 
-        for browser in browsers_to_close:
+    def _active_context_count_locked(self) -> int:
+        return sum(
+            1 for browser in self._browsers.values() if browser.has_shared_browser()
+        )
+
+    def _reserved_cold_context_count_locked(self) -> int:
+        """Count accounts that are about to create a context.
+
+        This closes the small race between reserving capacity and the
+        Playwright launch completing.  Multiple requests for the same cold
+        account still count as one context because that account is serialized
+        by ``TokenBrowser._semaphore``.
+        """
+        return sum(
+            1
+            for token_id, reservations in self._account_reservations.items()
+            if reservations > 0
+            and token_id in self._browsers
+            and not self._browsers[token_id].has_shared_browser()
+        )
+
+    def _context_capacity_in_use_locked(self) -> int:
+        return self._active_context_count_locked() + self._reserved_cold_context_count_locked()
+
+    def _oldest_idle_browser_locked(
+        self,
+        *,
+        exclude_token_id: Optional[int] = None,
+    ) -> Optional[TokenBrowser]:
+        candidates = [
+            browser
+            for token_id, browser in self._browsers.items()
+            if token_id != exclude_token_id
+            and token_id not in self._pending_context_evictions
+            and token_id not in self._removing_token_ids
+            and self._account_reservations.get(token_id, 0) == 0
+            and browser.has_shared_browser()
+            and not browser.is_busy()
+        ]
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda browser: (
+                float(getattr(browser, "_last_idle_since", 0.0) or 0.0),
+                browser.token_id,
+            ),
+        )
+
+    async def _trim_idle_contexts(self, reason: str):
+        """Close idle contexts when a lower browser_count is hot-reloaded."""
+        while True:
+            async with self._capacity_condition:
+                if self._active_context_count_locked() <= self._browser_count:
+                    return
+                browser = self._oldest_idle_browser_locked()
+                if browser is None:
+                    debug_logger.log_warning(
+                        "[BrowserCaptcha] browser_count 已降低，但剩余 context 都在使用中；"
+                        "将在请求完成后继续收敛"
+                    )
+                    return
+                self._pending_context_evictions.add(browser.token_id)
+
             try:
-                await browser.force_close_pending_browser(close_all=True)
-                await browser.recycle_browser(reason="browser_slot_removed", rotate_profile=False)
+                await browser.recycle_browser(reason=reason, rotate_profile=False)
+                if browser.has_shared_browser():
+                    # Do not spin forever on a context that failed to close.
+                    # The idle reaper will retry it on its next pass.
+                    debug_logger.log_warning(
+                        f"[BrowserCaptcha] 回收账户 {browser.token_id} 后 context 仍处于运行状态"
+                    )
+                    return
             except Exception as e:
-                debug_logger.log_warning(f"[BrowserCaptcha] ???????????: {e}")
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] 回收账户 {browser.token_id} context 失败: {e}"
+                )
+                if browser.has_shared_browser():
+                    return
+            finally:
+                async with self._capacity_condition:
+                    self._pending_context_evictions.discard(browser.token_id)
+                    self._capacity_condition.notify_all()
 
-            async with self._slot_allocation_lock:
-                self._slot_reservations = {
-                    slot_id: count
-                    for slot_id, count in self._slot_reservations.items()
-                    if 0 <= slot_id < self._browser_count and count > 0
-                }
+    async def reload_browser_count(self):
+        """Reload capacity without prewarming any account browser."""
+        await self._load_browser_count()
+        await self._ensure_idle_reaper()
+        await self._trim_idle_contexts(reason="browser_count_reloaded")
 
-        if self._browser_count > old_count:
-            warmup_tasks = [
-                self._warmup_browser_slot(browser_id)
-                for browser_id in range(old_count, self._browser_count)
-            ]
-            if warmup_tasks:
-                await asyncio.gather(*warmup_tasks, return_exceptions=True)
+    async def _recycle_account_context(
+        self,
+        token_id: int,
+        *,
+        reason: str,
+        rotate_profile: bool,
+    ):
+        """Recycle one account context without racing an active operation."""
+        normalized_token_id = _normalize_account_token_id(token_id)
+        async with self._capacity_condition:
+            if normalized_token_id in self._removing_token_ids:
+                return
+            browser = self._browsers.get(normalized_token_id)
+            if browser is None:
+                return
+            while self._account_reservations.get(normalized_token_id, 0) > 0:
+                await self._capacity_condition.wait()
+                if normalized_token_id in self._removing_token_ids:
+                    return
+                browser = self._browsers.get(normalized_token_id)
+                if browser is None:
+                    return
+            if not browser.has_shared_browser():
+                return
+            self._pending_context_evictions.add(normalized_token_id)
+
+        try:
+            await browser.recycle_browser(
+                reason=reason,
+                rotate_profile=rotate_profile,
+            )
+        except Exception as e:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] 回收账户 {normalized_token_id} context 失败: {e}"
+            )
+        finally:
+            async with self._capacity_condition:
+                self._pending_context_evictions.discard(normalized_token_id)
+                self._capacity_condition.notify_all()
 
     def _log_stats(self):
         total = self._stats["req_total"]
-        gen_fail = self._stats["gen_fail"]
-        api_403 = self._stats["api_403"]
-        gen_ok = self._stats["gen_ok"]
-        
-        valid_success = gen_ok - api_403
-        if valid_success < 0: valid_success = 0
-        
+        valid_success = max(self._stats["gen_ok"] - self._stats["api_403"], 0)
         rate = (valid_success / total * 100) if total > 0 else 0.0
+        debug_logger.log_info(
+            f"[BrowserCaptcha] stats total={total}, ok={self._stats['gen_ok']}, "
+            f"failed={self._stats['gen_fail']}, valid_rate={rate:.1f}%"
+        )
 
-    
     async def _warmup_browser_slot(self, browser_id: int):
-        browser = await self._get_or_create_browser(browser_id)
-        try:
-            await browser._get_or_create_shared_browser()
-            debug_logger.log_info(f"[BrowserCaptcha] warmed browser slot {browser_id}")
-        except Exception as e:
-            debug_logger.log_warning(f"[BrowserCaptcha] warmup for slot {browser_id} failed: {e}")
+        """Deprecated compatibility hook; account browsers are request-lazy."""
+        _ = browser_id
+        return None
 
     async def warmup_browser_slots(self):
-        tasks = [self._warmup_browser_slot(browser_id) for browser_id in range(self._browser_count)]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        """Deprecated no-op kept for older callers; never launches browsers."""
+        return []
 
-    def _is_slot_busy_for_allocation(self, slot_id: int) -> bool:
-        if self._slot_reservations.get(slot_id, 0) > 0:
-            return True
-        browser = self._browsers.get(slot_id)
-        return bool(browser and getattr(browser, 'is_busy', lambda: False)())
+    def _get_or_create_browser_locked(self, token_id: int) -> TokenBrowser:
+        browser = self._browsers.get(token_id)
+        if browser is None:
+            profile_dir = get_account_browser_profile_dir(
+                token_id,
+                self.base_user_data_dir,
+            )
+            browser = TokenBrowser(token_id, profile_dir, db=self.db, persistent_profile=True)
+            self._browsers[token_id] = browser
+            debug_logger.log_info(
+                f"[BrowserCaptcha] 创建账户浏览器对象 token_id={token_id}, profile={profile_dir}"
+            )
+        return browser
 
-    def _has_warmed_browser_for_allocation(self, slot_id: int) -> bool:
-        browser = self._browsers.get(slot_id)
-        return bool(browser and getattr(browser, 'has_shared_browser', lambda: False)())
+    async def _get_or_create_browser(self, token_id: int) -> TokenBrowser:
+        """获取或创建指定账户的轻量浏览器对象（不会启动 Chromium）。"""
+        normalized_token_id = _normalize_account_token_id(token_id)
+        async with self._browsers_lock:
+            return self._get_or_create_browser_locked(normalized_token_id)
 
-    def _reserve_slot_locked(self, slot_id: int):
-        self._slot_reservations[slot_id] = self._slot_reservations.get(slot_id, 0) + 1
+    async def _acquire_account_browser(self, token_id: int) -> TokenBrowser:
+        """Reserve capacity for an account, evicting the oldest idle context."""
+        normalized_token_id = _normalize_account_token_id(token_id)
+        reservation_held = False
 
-    async def _release_slot_reservation(self, slot_id: Optional[int]):
-        if slot_id is None:
-            return
-        async with self._slot_allocation_lock:
-            current = self._slot_reservations.get(slot_id, 0)
-            if current <= 1:
-                self._slot_reservations.pop(slot_id, None)
-            else:
-                self._slot_reservations[slot_id] = current - 1
-
-    async def _select_browser_id(self, project_id: Optional[str]) -> int:
-        # browser 模式不再按 project_id 粘住某个 slot。
-        # 优先复用空闲且已预热的共享浏览器，其次空闲冷槽位；全部繁忙时再轮询等待。
-        async with self._slot_allocation_lock:
-            async with self._browsers_lock:
-                warmed_idle_slot: Optional[int] = None
-                idle_slot: Optional[int] = None
-
-                for offset in range(self._browser_count):
-                    slot_id = (self._round_robin_index + offset) % self._browser_count
-                    if self._is_slot_busy_for_allocation(slot_id):
+        try:
+            while True:
+                browser_to_evict: Optional[TokenBrowser] = None
+                async with self._capacity_condition:
+                    if normalized_token_id in self._removing_token_ids:
+                        if reservation_held:
+                            current = self._account_reservations.get(normalized_token_id, 0)
+                            if current <= 1:
+                                self._account_reservations.pop(normalized_token_id, None)
+                            else:
+                                self._account_reservations[normalized_token_id] = current - 1
+                            reservation_held = False
+                            self._capacity_condition.notify_all()
+                        await self._capacity_condition.wait()
                         continue
 
-                    if idle_slot is None:
-                        idle_slot = slot_id
-                    if warmed_idle_slot is None and self._has_warmed_browser_for_allocation(slot_id):
-                        warmed_idle_slot = slot_id
-                        break
+                    browser = self._get_or_create_browser_locked(normalized_token_id)
+                    # An eviction is performed outside the condition lock.  Do
+                    # not let a new request use that context in the meantime.
+                    if normalized_token_id in self._pending_context_evictions:
+                        await self._capacity_condition.wait()
+                        continue
 
-                selected_slot = warmed_idle_slot if warmed_idle_slot is not None else idle_slot
-                if selected_slot is not None:
-                    self._round_robin_index = (selected_slot + 1) % self._browser_count
-                    self._reserve_slot_locked(selected_slot)
-                    return selected_slot
+                    if not reservation_held:
+                        self._account_reservations[normalized_token_id] = (
+                            self._account_reservations.get(normalized_token_id, 0) + 1
+                        )
+                        reservation_held = True
 
-                slot_id = self._get_next_browser_id()
-                self._reserve_slot_locked(slot_id)
-            return slot_id
+                    if browser.has_shared_browser():
+                        return browser
 
-    async def _get_or_create_browser(self, browser_id: int) -> TokenBrowser:
-        """获取或创建指定 ID 的浏览器实例"""
-        async with self._browsers_lock:
-            if browser_id not in self._browsers:
-                user_data_dir = os.path.join(self.base_user_data_dir, f"browser_{browser_id}")
-                browser = TokenBrowser(browser_id, user_data_dir, db=self.db)
-                self._browsers[browser_id] = browser
-                debug_logger.log_info(f"[BrowserCaptcha] 创建浏览器实例 {browser_id}")
-            return self._browsers[browser_id]
-    
+                    if self._context_capacity_in_use_locked() <= self._browser_count:
+                        return browser
+
+                    browser_to_evict = self._oldest_idle_browser_locked(
+                        exclude_token_id=normalized_token_id,
+                    )
+                    if browser_to_evict is None:
+                        current = self._account_reservations.get(normalized_token_id, 0)
+                        if current <= 1:
+                            self._account_reservations.pop(normalized_token_id, None)
+                        else:
+                            self._account_reservations[normalized_token_id] = current - 1
+                        reservation_held = False
+                        await self._capacity_condition.wait()
+                        continue
+
+                    self._pending_context_evictions.add(browser_to_evict.token_id)
+
+                eviction_failed = False
+                try:
+                    await browser_to_evict.recycle_browser(
+                        reason=f"capacity_for_token_{normalized_token_id}",
+                        rotate_profile=False,
+                    )
+                    if browser_to_evict.has_shared_browser():
+                        eviction_failed = True
+                except Exception as e:
+                    debug_logger.log_warning(
+                        f"[BrowserCaptcha] 回收账户 {browser_to_evict.token_id} context 失败: {e}"
+                    )
+                    eviction_failed = browser_to_evict.has_shared_browser()
+                finally:
+                    async with self._capacity_condition:
+                        self._pending_context_evictions.discard(browser_to_evict.token_id)
+                        self._capacity_condition.notify_all()
+                if eviction_failed:
+                    raise RuntimeError(
+                        f"account {browser_to_evict.token_id} context is still running"
+                    )
+                # Keep the target reservation while retrying so another
+                # request cannot evict a context we are about to create.
+        except BaseException:
+            if reservation_held:
+                await self._release_account_reservation(normalized_token_id)
+            raise
+
+    async def _release_account_reservation(self, token_id: Optional[int]):
+        if token_id is None:
+            return
+        try:
+            normalized_token_id = _normalize_account_token_id(token_id)
+        except ValueError:
+            return
+        async with self._capacity_condition:
+            current = self._account_reservations.get(normalized_token_id, 0)
+            if current <= 1:
+                self._account_reservations.pop(normalized_token_id, None)
+            else:
+                self._account_reservations[normalized_token_id] = current - 1
+            self._capacity_condition.notify_all()
+
+    async def _release_slot_reservation(self, slot_id: Optional[int]):
+        """Backward-compatible alias using token ids as the slot handle."""
+        await self._release_account_reservation(slot_id)
+
+    async def _select_browser_id(self, token_id: Optional[int]) -> int:
+        """Compatibility helper; browser handles are stable token ids now."""
+        return _normalize_account_token_id(token_id)
+
     def _get_next_browser_id(self) -> int:
-        """轮询获取下一个浏览器 ID"""
-        browser_id = self._round_robin_index % self._browser_count
-        self._round_robin_index += 1
-        return browser_id
+        """Return a negative id for a temporary diagnostic browser."""
+        self._diagnostic_sequence += 1
+        return -self._diagnostic_sequence
+
+    async def _get_or_create_diagnostic_browser(self) -> tuple[int, TokenBrowser]:
+        async with self._browsers_lock:
+            diagnostic_id = self._get_next_browser_id()
+            browser = TokenBrowser(
+                diagnostic_id,
+                os.path.join(
+                    self.base_user_data_dir,
+                    "diagnostics",
+                    f"run_{abs(diagnostic_id)}",
+                ),
+                db=self.db,
+                persistent_profile=False,
+            )
+            self._diagnostic_browsers[diagnostic_id] = browser
+            # Diagnostic browsers are closed per request; retain only a small
+            # fingerprint history for the admin endpoint.
+            while len(self._diagnostic_browsers) > 32:
+                oldest_id = next(iter(self._diagnostic_browsers))
+                self._diagnostic_browsers.pop(oldest_id, None)
+            return diagnostic_id, browser
 
     @staticmethod
     def _compose_browser_ref(browser_id: int, request_ref: Optional[str]) -> Union[int, str]:
-        """将 browser_id 与 request_ref 合并为可回传的请求句柄。"""
+        """将 account id 与 request_ref 合并为可回传的请求句柄。"""
         if request_ref:
             return f"{browser_id}:{request_ref}"
         return browser_id
 
     @staticmethod
-    def _parse_browser_ref(browser_ref: Optional[Union[int, str]]) -> tuple[Optional[int], Optional[str]]:
-        """解析请求句柄，兼容旧的纯 int browser_id。"""
+    def _parse_browser_ref(
+        browser_ref: Optional[Union[int, str]],
+    ) -> tuple[Optional[int], Optional[str]]:
+        """解析请求句柄，兼容纯 int 及负数诊断句柄。"""
         if browser_ref is None:
             return None, None
-
         if isinstance(browser_ref, int):
             return browser_ref, None
-
         if isinstance(browser_ref, str):
             raw = browser_ref.strip()
-            if raw.isdigit():
+            try:
                 return int(raw), None
+            except ValueError:
+                pass
             browser_id_part, sep, request_ref = raw.partition(":")
-            if sep and browser_id_part.isdigit() and request_ref:
-                return int(browser_id_part), request_ref
-
+            if sep and request_ref:
+                try:
+                    return int(browser_id_part), request_ref
+                except ValueError:
+                    pass
         return None, None
 
     async def _resolve_token_proxy_url(self, token_id: Optional[int]) -> Optional[str]:
@@ -2807,71 +3286,41 @@ class BrowserCaptchaService:
         except Exception as e:
             debug_logger.log_warning(f"[BrowserCaptcha] 读取 token({token_id}) 打码代理失败: {e}")
         return None
-    
-    async def get_token(self, project_id: str, action: str = "IMAGE_GENERATION", token_id: int = None) -> tuple[Optional[str], Union[int, str]]:
-        """获取 reCAPTCHA Token（从共享浏览器池选择 slot）
-        
-        Args:
-            project_id: 项目 ID
-            action: reCAPTCHA action
-            token_id: 业务 token id（仅用于读取 token 级打码代理）
-        
-        Returns:
-            (token, browser_ref) 元组，browser_ref 包含 browser_id 与请求级 request_ref
-        """
-        # 检查服务是否可用
+
+    async def get_token(
+        self,
+        project_id: str,
+        action: str = "IMAGE_GENERATION",
+        token_id: int = None,
+    ) -> tuple[Optional[str], Union[int, str]]:
+        """获取指定账户的 reCAPTCHA token。"""
         self._check_available()
-        
+        normalized_token_id = _normalize_account_token_id(token_id)
         self._stats["req_total"] += 1
-        token_proxy_url = await self._resolve_token_proxy_url(token_id)
-        
-        token: Optional[str] = None
-        request_ref: Optional[str] = None
+        token_proxy_url = await self._resolve_token_proxy_url(normalized_token_id)
 
-        # 全局并发限制（如果已配置）
-        if self._token_semaphore:
-            async with self._token_semaphore:
-                browser_id = await self._select_browser_id(project_id)
-                try:
-                    browser = await self._get_or_create_browser(browser_id)
-                    token, request_ref = await browser.get_token(
-                        project_id,
-                        self.website_key,
-                        action,
-                        token_proxy_url=token_proxy_url,
-                        token_id=token_id,
-                    )
-                finally:
-                    await self._release_slot_reservation(browser_id)
-
-            if token:
-                self._stats["gen_ok"] += 1
-            else:
-                self._stats["gen_fail"] += 1
-                
-            self._log_stats()
-            return token, self._compose_browser_ref(browser_id, request_ref)
-        
-        browser_id = await self._select_browser_id(project_id)
+        # Context capacity is reserved per account below.  Do not put this
+        # operation behind one global semaphore: two requests for the same
+        # account are already serialized by TokenBrowser._semaphore, while a
+        # different account must still be able to use another context slot.
+        browser = await self._acquire_account_browser(normalized_token_id)
         try:
-            browser = await self._get_or_create_browser(browser_id)
             token, request_ref = await browser.get_token(
                 project_id,
                 self.website_key,
                 action,
                 token_proxy_url=token_proxy_url,
-                token_id=token_id,
+                token_id=normalized_token_id,
             )
         finally:
-            await self._release_slot_reservation(browser_id)
+            await self._release_account_reservation(normalized_token_id)
 
         if token:
             self._stats["gen_ok"] += 1
         else:
             self._stats["gen_fail"] += 1
-            
         self._log_stats()
-        return token, self._compose_browser_ref(browser_id, request_ref)
+        return token, self._compose_browser_ref(normalized_token_id, request_ref)
 
     async def get_custom_token(
         self,
@@ -2880,29 +3329,16 @@ class BrowserCaptchaService:
         action: str = "homepage",
         enterprise: bool = False,
     ) -> tuple[Optional[str], int]:
-        """获取任意站点的 reCAPTCHA token，用于分数测试。"""
+        """获取任意站点 token；诊断流程使用临时非账户 context。"""
         self._check_available()
-
-        if self._token_semaphore:
-            async with self._token_semaphore:
-                browser_id = self._get_next_browser_id()
-                browser = await self._get_or_create_browser(browser_id)
-                token = await browser.get_custom_token(
-                    website_url=website_url,
-                    website_key=website_key,
-                    action=action,
-                    enterprise=enterprise,
-                )
-            return token, browser_id
-
-        browser_id = self._get_next_browser_id()
-        browser = await self._get_or_create_browser(browser_id)
-        token = await browser.get_custom_token(
-            website_url=website_url,
-            website_key=website_key,
-            action=action,
-            enterprise=enterprise,
-        )
+        async with self._diagnostic_semaphore:
+            browser_id, browser = await self._get_or_create_diagnostic_browser()
+            token = await browser.get_custom_token(
+                website_url=website_url,
+                website_key=website_key,
+                action=action,
+                enterprise=enterprise,
+            )
         return token, browser_id
 
     async def get_custom_score(
@@ -2913,44 +3349,30 @@ class BrowserCaptchaService:
         action: str = "homepage",
         enterprise: bool = False,
     ) -> tuple[Dict[str, Any], int]:
-        """在浏览器页面内完成 token 获取与分数校验。"""
+        """在临时非账户浏览器页面内完成 token 获取与分数校验。"""
         self._check_available()
-
-        if self._token_semaphore:
-            async with self._token_semaphore:
-                browser_id = self._get_next_browser_id()
-                browser = await self._get_or_create_browser(browser_id)
-                payload = await browser.get_custom_score(
-                    website_url=website_url,
-                    website_key=website_key,
-                    verify_url=verify_url,
-                    action=action,
-                    enterprise=enterprise,
-                )
-            return payload, browser_id
-
-        browser_id = self._get_next_browser_id()
-        browser = await self._get_or_create_browser(browser_id)
-        payload = await browser.get_custom_score(
-            website_url=website_url,
-            website_key=website_key,
-            verify_url=verify_url,
-            action=action,
-            enterprise=enterprise,
-        )
+        async with self._diagnostic_semaphore:
+            browser_id, browser = await self._get_or_create_diagnostic_browser()
+            payload = await browser.get_custom_score(
+                website_url=website_url,
+                website_key=website_key,
+                verify_url=verify_url,
+                action=action,
+                enterprise=enterprise,
+            )
         return payload, browser_id
 
-    async def get_fingerprint(self, browser_ref: Optional[Union[int, str]]) -> Optional[Dict[str, Any]]:
-        """获取指定浏览器最近一次打码时的指纹快照。"""
+    async def get_fingerprint(
+        self,
+        browser_ref: Optional[Union[int, str]],
+    ) -> Optional[Dict[str, Any]]:
+        """获取指定账户/诊断浏览器最近一次打码时的指纹快照。"""
         browser_id, _ = self._parse_browser_ref(browser_ref)
         if browser_id is None:
             return None
-
         async with self._browsers_lock:
-            browser = self._browsers.get(browser_id)
-            if not browser:
-                return None
-            return browser.get_last_fingerprint()
+            browser = self._browsers.get(browser_id) or self._diagnostic_browsers.get(browser_id)
+            return browser.get_last_fingerprint() if browser else None
 
     async def submit_flow_request(
         self,
@@ -2962,13 +3384,12 @@ class BrowserCaptchaService:
         json_data: Dict[str, Any],
         timeout: int,
     ) -> tuple[Dict[str, Any], Union[int, str], Optional[Dict[str, Any]]]:
-        """在 browser 模式下于同一浏览器上下文内完成打码并提交 Flow 请求。"""
+        """在目标账户的持久化 context 内完成打码并提交 Flow 请求。"""
         self._check_available()
-
-        token_proxy_url = await self._resolve_token_proxy_url(token_id)
-        browser_id = await self._select_browser_id(project_id)
+        normalized_token_id = _normalize_account_token_id(token_id)
+        token_proxy_url = await self._resolve_token_proxy_url(normalized_token_id)
+        browser = await self._acquire_account_browser(normalized_token_id)
         try:
-            browser = await self._get_or_create_browser(browser_id)
             response_payload = await browser.submit_flow_request(
                 project_id=project_id,
                 website_key=self.website_key,
@@ -2978,72 +3399,164 @@ class BrowserCaptchaService:
                 json_data=json_data,
                 timeout=timeout,
                 token_proxy_url=token_proxy_url,
-                token_id=token_id,
+                token_id=normalized_token_id,
             )
             fingerprint = browser.get_last_fingerprint()
-            return response_payload, self._compose_browser_ref(browser_id, None), fingerprint
+            return (
+                response_payload,
+                self._compose_browser_ref(normalized_token_id, None),
+                fingerprint,
+            )
         finally:
-            await self._release_slot_reservation(browser_id)
+            await self._release_account_reservation(normalized_token_id)
 
-    async def report_error(self, browser_ref: Optional[Union[int, str]] = None, error_reason: Optional[str] = None):
-        """Handle upstream errors; recycle the browser only for explicit reCAPTCHA evaluation failures."""
+    async def report_error(
+        self,
+        browser_ref: Optional[Union[int, str]] = None,
+        error_reason: Optional[str] = None,
+    ):
+        """Recycle an account context after an explicit captcha failure."""
         browser_id, _ = self._parse_browser_ref(browser_ref)
-
-        async with self._browsers_lock:
+        async with self._capacity_condition:
             browser = self._browsers.get(browser_id) if browser_id is not None else None
             error_lower = (error_reason or "").lower()
             has_recaptcha = "recaptcha" in error_lower
             should_recycle = has_recaptcha and (
                 "evaluation failed" in error_lower
-                or "verification failed" in error_lower or "验证失败" in (error_reason or "")
+                or "verification failed" in error_lower
+                or "验证失败" in (error_reason or "")
                 or "failed" in error_lower
             )
             if should_recycle:
                 self._stats["api_403"] += 1
             if browser_id is not None:
                 debug_logger.log_info(
-                    f"[BrowserCaptcha] browser {browser_id} failure reported, reason={error_reason or 'unknown'}, recycle={should_recycle}"
+                    f"[BrowserCaptcha] account {browser_id} failure reported, "
+                    f"reason={error_reason or 'unknown'}, recycle={should_recycle}"
                 )
 
         if browser and should_recycle:
-            try:
-                await browser.recycle_browser(
-                    reason=error_reason or "recaptcha_evaluation_failed",
-                    rotate_profile=True,
-                )
-            except Exception as e:
-                debug_logger.log_warning(f"[BrowserCaptcha] browser {browser_id} recycle failed: {e}")
+            await self._recycle_account_context(
+                browser_id,
+                reason=error_reason or "recaptcha_evaluation_failed",
+                rotate_profile=True,
+            )
 
-    async def report_request_finished(self, browser_ref: Optional[Union[int, str]] = None):
-        """上层通知本次请求已完成；browser 模式仅保留常驻浏览器，不在成功后主动关闭。"""
+    async def report_request_finished(
+        self,
+        browser_ref: Optional[Union[int, str]] = None,
+    ):
+        """Log the completion notification; idle TTL controls context reuse."""
         browser_id, _ = self._parse_browser_ref(browser_ref)
         if browser_id is None:
             return
-
         async with self._browsers_lock:
             browser = self._browsers.get(browser_id)
-
         if browser:
             keepalive_alive = False
-            keepalive_page = getattr(browser, '_shared_keepalive_page', None)
+            keepalive_page = getattr(browser, "_shared_keepalive_page", None)
             try:
                 keepalive_alive = bool(keepalive_page and not keepalive_page.is_closed())
             except Exception:
-                keepalive_alive = False
+                pass
             debug_logger.log_info(
-                f"[BrowserCaptcha] browser {browser_id} request finished; keepalive_alive={keepalive_alive}"
+                f"[BrowserCaptcha] account {browser_id} request finished; "
+                f"keepalive_alive={keepalive_alive}"
             )
 
+    async def remove_token(self, token_id: int, delete_profile: bool = True) -> bool:
+        """Close one account context and optionally remove its profile."""
+        normalized_token_id = _normalize_account_token_id(token_id)
+        browser: Optional[TokenBrowser] = None
+        try:
+            async with self._capacity_condition:
+                self._removing_token_ids.add(normalized_token_id)
+                # Keep the object in the map until its context is actually
+                # closed so deletion cannot temporarily make capacity look
+                # available while the old Chromium process is still alive.
+                while self._account_reservations.get(normalized_token_id, 0) > 0:
+                    await self._capacity_condition.wait()
+                browser = self._browsers.get(normalized_token_id)
+                self._capacity_condition.notify_all()
+
+            if browser:
+                wait_timeout = max(
+                    5.0,
+                    min(120.0, float(getattr(config, "flow_timeout", 120) or 120)),
+                )
+                became_idle = await browser.wait_until_idle(wait_timeout)
+                if not became_idle:
+                    debug_logger.log_warning(
+                        f"[BrowserCaptcha] 删除 token {normalized_token_id} 时浏览器仍繁忙，执行强制关闭"
+                    )
+                await browser.force_close_pending_browser(close_all=True)
+                if browser.has_shared_browser():
+                    await browser.recycle_browser(
+                        reason="token_removed",
+                        rotate_profile=False,
+                    )
+            else:
+                # The service may have been recreated after a crash while a
+                # stale account PID marker still points at Chromium.
+                probe = TokenBrowser(
+                    normalized_token_id,
+                    get_account_browser_profile_dir(
+                        normalized_token_id,
+                        self.base_user_data_dir,
+                    ),
+                    db=None,
+                    persistent_profile=False,
+                )
+                await probe._cleanup_stale_account_process()
+
+            if delete_profile:
+                deleted = delete_account_browser_profile(
+                    normalized_token_id,
+                    self.base_user_data_dir,
+                )
+                if deleted:
+                    debug_logger.log_info(
+                        f"[BrowserCaptcha] 已删除 token {normalized_token_id} 的账户 profile"
+                    )
+                return deleted
+            return False
+        finally:
+            async with self._capacity_condition:
+                if self._browsers.get(normalized_token_id) is browser:
+                    self._browsers.pop(normalized_token_id, None)
+                self._account_reservations.pop(normalized_token_id, None)
+                self._pending_context_evictions.discard(normalized_token_id)
+                self._removing_token_ids.discard(normalized_token_id)
+                self._capacity_condition.notify_all()
+
+    @classmethod
+    async def remove_token_profile(
+        cls,
+        token_id: int,
+        base_user_data_dir: Optional[str] = None,
+    ) -> bool:
+        """Close/delete an account profile even if the service was never instantiated."""
+        service = cls._instance
+        if service is not None:
+            return await service.remove_token(token_id, delete_profile=True)
+
+        # There is normally no live browser when the service was not created.
+        # Still clear a matching stale PID marker before deleting the profile.
+        profile_dir = get_account_browser_profile_dir(token_id, base_user_data_dir)
+        probe = TokenBrowser(
+            _normalize_account_token_id(token_id),
+            profile_dir,
+            db=None,
+            persistent_profile=False,
+        )
+        await probe._cleanup_stale_account_process()
+        return delete_account_browser_profile(token_id, base_user_data_dir)
+
     async def remove_browser(self, browser_id: int):
-        async with self._browsers_lock:
-            if browser_id in self._browsers:
-                self._browsers.pop(browser_id)
+        """Backward-compatible account removal without profile deletion."""
+        await self.remove_token(browser_id, delete_profile=False)
 
     async def close(self):
-        async with self._browsers_lock:
-            browsers = list(self._browsers.values())
-            self._browsers.clear()
-
         if self._idle_reaper_task and not self._idle_reaper_task.done():
             self._idle_reaper_task.cancel()
             try:
@@ -3051,30 +3564,61 @@ class BrowserCaptchaService:
             except asyncio.CancelledError:
                 pass
 
-        for browser in browsers:
+        async with self._capacity_condition:
+            browsers = list(self._browsers.values())
+            diagnostic_browsers = list(self._diagnostic_browsers.values())
+            self._browsers.clear()
+            self._diagnostic_browsers.clear()
+            self._account_reservations.clear()
+            self._pending_context_evictions.clear()
+            self._capacity_condition.notify_all()
+
+        for browser in browsers + diagnostic_browsers:
             try:
+                await browser.wait_until_idle(
+                    max(5.0, min(120.0, float(getattr(config, "flow_timeout", 120) or 120)))
+                )
                 await browser.force_close_pending_browser(close_all=True)
-                await browser.recycle_browser(reason="service_shutdown", rotate_profile=False)
+                if browser.has_shared_browser():
+                    await browser.recycle_browser(reason="service_shutdown", rotate_profile=False)
             except Exception:
                 pass
-            
-    async def open_login_browser(self): return {"success": False, "error": "Not implemented"}
-    async def create_browser_for_token(self, t, s=None): pass
-    def get_stats(self): 
+
+    async def open_login_browser(self):
+        return {"success": False, "error": "Not implemented"}
+
+    async def create_browser_for_token(self, t, s=None):
+        _ = t
+        _ = s
+        return None
+
+    def get_stats(self):
         browsers = list(self._browsers.values())
-        busy_browser_count = sum(1 for browser in browsers if getattr(browser, "is_busy", lambda: False)())
-        shared_browser_count = sum(1 for browser in browsers if getattr(browser, "has_shared_browser", lambda: False)())
-        base_stats = {
+        busy_browser_count = sum(
+            1 for browser in browsers if getattr(browser, "is_busy", lambda: False)()
+        )
+        shared_browser_count = sum(
+            1 for browser in browsers if getattr(browser, "has_shared_browser", lambda: False)()
+        )
+        return {
             "total_solve_count": self._stats["gen_ok"],
             "total_error_count": self._stats["gen_fail"],
             "risk_403_count": self._stats["api_403"],
-            "browser_count": len(self._browsers),
+            "browser_count": shared_browser_count,
+            "account_browser_count": len(browsers),
             "configured_browser_count": self._browser_count,
             "busy_browser_count": busy_browser_count,
-            "idle_browser_count": max(self._browser_count - busy_browser_count, 0),
+            "idle_browser_count": sum(1 for browser in browsers if not browser.is_busy()),
+            "available_browser_slots": max(self._browser_count - shared_browser_count, 0),
             "shared_browser_count": shared_browser_count,
             "project_affinity_count": 0,
-            "browsers": []
+            "browsers": [
+                {
+                    "token_id": browser.token_id,
+                    "profile_dir": browser.user_data_dir,
+                    "has_shared_browser": browser.has_shared_browser(),
+                    "busy": browser.is_busy(),
+                }
+                for browser in browsers
+            ],
         }
-        return base_stats
-

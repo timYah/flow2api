@@ -1,4 +1,8 @@
+FROM ghcr.io/astral-sh/uv:0.10.12 AS uv
+
 FROM python:3.11-slim
+
+COPY --from=uv /uv /uvx /bin/
 
 WORKDIR /app
 
@@ -17,11 +21,11 @@ RUN apt-get update \
         xvfb \
     && rm -rf /var/lib/apt/lists/*
 
-# 在镜像构建阶段预装 Playwright Chromium，供 personal/browser 模式复用
-COPY requirements.txt ./
+# 在镜像构建阶段预装锁定依赖和 Playwright Chromium，供 personal/browser 模式复用
+COPY pyproject.toml uv.lock ./
 
-RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt \
-    && python -m playwright install --with-deps chromium
+RUN uv sync --frozen --no-dev --no-install-project \
+    && uv run --no-sync python -m playwright install --with-deps chromium
 
 COPY . .
 COPY docker/entrypoint.headed.sh /usr/local/bin/entrypoint.headed.sh

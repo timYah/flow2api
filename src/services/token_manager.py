@@ -25,6 +25,11 @@ class TokenManager:
         self._refresh_futures: dict[int, asyncio.Task] = {}
         self._at_validation_cache: dict[int, float] = {}
         self._protocol_refresher_task: Optional[asyncio.Task] = None
+        self._last_auto_refresh_attempt: dict[int, float] = {}
+        self._last_refresh_error: dict[int, str] = {}
+
+    def get_last_refresh_error(self, token_id: int) -> Optional[str]:
+        return self._last_refresh_error.get(token_id)
 
     async def _get_token_lock(
         self,
@@ -188,6 +193,29 @@ class TokenManager:
         project.id = await self.db.add_project(project)
         return project
 
+    async def create_client_project(self, token: Token, client_project_id: str) -> Project:
+        """Create and persist a project bound to a client-provided alias."""
+        normalized_client_project_id = str(client_project_id or "").strip()
+        if not normalized_client_project_id:
+            raise ValueError("client_project_id cannot be empty")
+
+        project_id = await self.flow_client.create_project(
+            token.st,
+            normalized_client_project_id,
+        )
+        project = Project(
+            project_id=project_id,
+            client_project_id=normalized_client_project_id,
+            token_id=token.id,
+            project_name=normalized_client_project_id,
+        )
+        project.id = await self.db.add_project(project)
+        debug_logger.log_info(
+            f"[PROJECT] Created client project for token {token.id}: "
+            f"alias={normalized_client_project_id!r}, project_id={project_id}"
+        )
+        return project
+
     def _select_next_project(self, token: Token, projects: List[Project]) -> Project:
         """Select the next project from the pool in round-robin order."""
         ordered_projects = self._sort_projects(projects)
@@ -245,6 +273,15 @@ class TokenManager:
                 pass
         self._refresh_locks.pop(token_id, None)
         self._project_locks.pop(token_id, None)
+
+        # browser 模式使用 token_id 作为账户 profile 的稳定身份。即使
+        # 服务尚未实例化，也要清理对应目录；清理失败不影响数据库删除。
+        if config.captcha_method == "browser":
+            try:
+                from .browser_captcha import BrowserCaptchaService
+                await BrowserCaptchaService.remove_token_profile(token_id)
+            except Exception as e:
+                debug_logger.log_warning(f"[DELETE_TOKEN] 清理 browser 账户 profile 失败: {e}")
 
         if config.captcha_method == "personal" and project_ids:
             try:
@@ -463,7 +500,7 @@ class TokenManager:
             update_fields["ban_reason"] = None
             update_fields["banned_at"] = None
 
-        if token and token.ban_reason == "429_rate_limit":
+        if token and token.ban_reason in ("429_rate_limit", "unusual_activity"):
             # 检查token是否过期
             is_expired = False
             if token.at_expires:
@@ -474,9 +511,9 @@ class TokenManager:
                     at_expires_aware = token.at_expires
                 is_expired = at_expires_aware <= now
 
-            # 如果未过期，清空429禁用状态
+            # 如果未过期，清空禁用状态
             if not is_expired:
-                debug_logger.log_info(f"[UPDATE_TOKEN] Token {token_id} 编辑保存，清空429禁用状态")
+                debug_logger.log_info(f"[UPDATE_TOKEN] Token {token_id} 编辑保存，清空{token.ban_reason}禁用状态")
                 update_fields["ban_reason"] = None
                 update_fields["banned_at"] = None
 
@@ -575,6 +612,31 @@ class TokenManager:
 
             result = await self._do_refresh_at(token_id, token.st, token)
             if result:
+                self._last_refresh_error.pop(token_id, None)
+                latest_token = await self.db.get_token(token_id)
+                if latest_token and not self._should_refresh_at(latest_token):
+                    if not latest_token.is_active:
+                        await self.enable_token(token_id)
+                        debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: 刷新成功并自动启用")
+                    return True
+                debug_logger.log_info(
+                    f"[AT_REFRESH] Token {token_id}: 当前 AT 仍处于即将过期状态，尝试刷新 ST..."
+                )
+                new_st = await self._try_refresh_st(token_id, token)
+                if new_st:
+                    latest_token = await self.db.get_token(token_id) or token
+                    result = await self._do_refresh_at(token_id, new_st, latest_token)
+                    if result:
+                        if not latest_token.is_active:
+                            await self.enable_token(token_id)
+                            debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: 刷新成功并自动启用")
+                        return True
+                debug_logger.log_warning(
+                    f"[AT_REFRESH] Token {token_id}: 尝试刷新 ST 未获得新凭证，但当前 AT 仍有效，保持启用"
+                )
+                if not latest_token.is_active:
+                    await self.enable_token(token_id)
+                    debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: 保持启用并自动开启")
                 return True
 
             debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: first AT refresh failed, trying ST refresh...")
@@ -584,6 +646,10 @@ class TokenManager:
                 latest_token = await self.db.get_token(token_id) or token
                 result = await self._do_refresh_at(token_id, new_st, latest_token)
                 if result:
+                    self._last_refresh_error.pop(token_id, None)
+                    if not latest_token.is_active:
+                        await self.enable_token(token_id)
+                        debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: 刷新成功并自动启用")
                     return True
 
             debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: all refresh attempts failed, disabling token")
@@ -629,6 +695,15 @@ class TokenManager:
                 if token is not None
                 else self.flow_client.st_to_at(st)
             )
+
+            # 检查上游是否返回鉴权错误（如 ACCESS_TOKEN_REFRESH_NEEDED）
+            if result.get("error"):
+                error_code = str(result.get("error"))
+                debug_logger.log_warning(f"[AT_REFRESH] Token {token_id}: 上游返回错误: {error_code}, ST 需要刷新")
+                self._last_refresh_error[token_id] = f"Session Token (ST) 已失效 ({error_code})，需要刷新 ST"
+                record_token_refresh("at", "failure")
+                return False
+
             new_at = result["access_token"]
             expires = result.get("expires")
 
@@ -750,9 +825,62 @@ class TokenManager:
             if protocol_st:
                 return protocol_st
 
-            # 仅在 personal 模式下支持 ST 自动刷新
+            if config.captcha_method == "extension":
+                debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 尝试通过 Chrome 扩展刷新 ST...")
+                from .browser_captcha_extension import ExtensionCaptchaService
+                service = await ExtensionCaptchaService.get_instance(self.db)
+                has_conn, route_key = await service.has_connection_for_token(token_id, token)
+                if not has_conn:
+                    msg = f"目标扩展未连接 (route_key='{route_key or 'default'}')，无法刷新 ST"
+                    debug_logger.log_warning(f"[ST_REFRESH] Token {token_id}: {msg}")
+                    self._last_refresh_error[token_id] = msg
+                    return None
+                try:
+                    refresh_result = await service.refresh_session_token(
+                        token_id=token_id,
+                        old_st=getattr(token, "st", None),
+                        route_key=route_key,
+                        email=getattr(token, "email", ""),
+                        timeout=60,
+                    )
+                except Exception as ext_err:
+                    msg = f"扩展刷新 ST 失败: {ext_err}"
+                    debug_logger.log_error(f"[ST_REFRESH] Token {token_id}: {msg}")
+                    self._last_refresh_error[token_id] = msg
+                    record_token_refresh("st", "failure")
+                    return None
+
+                if refresh_result and refresh_result.get("session_token"):
+                    new_st = str(refresh_result["session_token"]).strip()
+                    if new_st:
+                        new_at = refresh_result.get("access_token")
+                        at_expires = None
+                        if refresh_result.get("expires"):
+                            try:
+                                at_expires = datetime.fromisoformat(
+                                    str(refresh_result["expires"]).replace("Z", "+00:00")
+                                )
+                            except Exception:
+                                pass
+                        update_kwargs = {"st": new_st}
+                        if new_at:
+                            update_kwargs["at"] = new_at
+                        if at_expires:
+                            update_kwargs["at_expires"] = at_expires
+                        await self.db.update_token(token_id, **update_kwargs)
+                        debug_logger.log_info(
+                            f"[ST_REFRESH] Token {token_id}: 扩展成功刷新 ST" + (" 及 AT" if new_at else "")
+                        )
+                        record_token_refresh("st", "success")
+                        return new_st
+
+                debug_logger.log_warning(f"[ST_REFRESH] Token {token_id}: 扩展未返回有效 ST")
+                record_token_refresh("st", "failure")
+                return None
+
+            # 仅在 personal 模式下支持内置浏览器 ST 自动刷新
             if config.captcha_method != "personal":
-                debug_logger.log_info(f"[ST_REFRESH] 非 personal 模式，跳过 ST 自动刷新")
+                debug_logger.log_info(f"[ST_REFRESH] 非 personal / extension 模式，跳过 ST 自动刷新")
                 return None
 
             if not token.current_project_id:
@@ -857,6 +985,99 @@ class TokenManager:
                 record_token_refresh("at", "failure")
                 debug_logger.log_error(f"[PROTOCOL_REFRESH] Token {token_id}: 协议 ST 转 AT 失败 - {e}")
 
+    async def run_at_refresh_once(self) -> None:
+        """自动检查并刷新所有接近过期或需要刷新的 Token AT。"""
+        try:
+            refresh_config = await self.db.get_token_refresh_config()
+        except Exception as e:
+            debug_logger.log_warning(f"[AUTO_REFRESH] 读取刷新配置失败: {e}")
+            return
+
+        if not refresh_config or not refresh_config.enabled:
+            return
+
+        all_tokens = []
+        try:
+            res = await self.db.get_all_tokens()
+            if isinstance(res, list):
+                all_tokens = res
+        except Exception:
+            pass
+
+        if all_tokens:
+            tokens = [
+                t for t in all_tokens
+                if getattr(t, "auto_refresh_enabled", True) and not getattr(t, "ban_reason", None)
+            ]
+        else:
+            active_res = await self.db.get_active_tokens()
+            tokens = active_res if isinstance(active_res, list) else []
+        now_mono = time.monotonic()
+        now_utc = datetime.now(timezone.utc)
+
+        for token in tokens:
+            try:
+                if not token.auto_refresh_enabled:
+                    continue
+
+                # 协议模式由专门的 protocol_refresh 逻辑处理，避免重复刷新
+                if (
+                    self._normalize_protocol_mode(token.protocol_mode) == "protocol"
+                    and (token.google_cookies or "").strip()
+                ):
+                    continue
+
+                # 检查是否需要刷新 AT (过期、无过期时间、或距离过期 < 1小时)
+                if not self._should_refresh_at(token):
+                    # 如果 AT 有效但 token 处于禁用状态，自动启用！
+                    if not token.is_active:
+                        await self.enable_token(int(token.id))
+                        debug_logger.log_info(f"[AUTO_REFRESH] Token {token.id} ({token.email}): AT 有效，自动启用")
+                    continue
+
+                token_id = int(token.id)
+
+                # 避免频繁失败重试冲击（300秒冷却），但若距离过期 <= 300秒或已过期则强制尝试
+                last_attempt = self._last_auto_refresh_attempt.get(token_id, 0.0)
+                time_until_expiry_sec = None
+                if token.at_expires:
+                    expires_aware = (
+                        token.at_expires.replace(tzinfo=timezone.utc)
+                        if token.at_expires.tzinfo is None
+                        else token.at_expires
+                    )
+                    time_until_expiry_sec = (expires_aware - now_utc).total_seconds()
+
+                is_urgent = (time_until_expiry_sec is None) or (time_until_expiry_sec <= 300)
+                if not is_urgent and (now_mono - last_attempt < 300):
+                    continue
+
+                self._last_auto_refresh_attempt[token_id] = now_mono
+                expiry_desc = f"{time_until_expiry_sec:.0f}s" if time_until_expiry_sec is not None else "未知"
+                debug_logger.log_info(
+                    f"[AUTO_REFRESH] Token {token_id} ({token.email or '-'}): "
+                    f"触发自动刷新 AT (剩余有效期: {expiry_desc})..."
+                )
+
+                success = await self._refresh_at(token_id)
+                if success:
+                    updated = await self.db.get_token(token_id)
+                    if updated and not updated.is_active:
+                        await self.enable_token(token_id)
+                        debug_logger.log_info(f"[AUTO_REFRESH] Token {token_id}: 自动刷新 AT 成功并已自动启用")
+                    exp_str = updated.at_expires.isoformat() if updated and updated.at_expires else "未知"
+                    debug_logger.log_info(f"[AUTO_REFRESH] Token {token_id}: 自动刷新 AT 成功, 新过期时间: {exp_str}")
+                else:
+                    debug_logger.log_warning(f"[AUTO_REFRESH] Token {token_id}: 自动刷新 AT 失败")
+
+            except Exception as e:
+                debug_logger.log_error(f"[AUTO_REFRESH] Token {getattr(token, 'id', '?')}: 自动刷新 AT 异常 - {e}")
+
+    async def run_auto_refresh_once(self) -> None:
+        """运行单次后台自动刷新（包含普通 Token AT 临期自动刷新与 Protocol ST 周期刷新）。"""
+        await self.run_at_refresh_once()
+        await self.run_protocol_refresh_once()
+
     async def run_protocol_refresh_once(self) -> None:
         """Refresh protocol-mode tokens whose ST refresh interval is due."""
         try:
@@ -889,20 +1110,88 @@ class TokenManager:
             except Exception as e:
                 debug_logger.log_error(f"[PROTOCOL_REFRESH] Token {getattr(token, 'id', '?')}: 后台刷新异常 - {e}")
 
-    async def _protocol_refresh_loop(self) -> None:
+    async def _auto_refresh_loop(self) -> None:
+        # 启动后稍作等待，让各服务组件（如 WebSocket 连接、数据库）初始化完毕
+        await asyncio.sleep(5)
         while True:
-            await asyncio.sleep(60)
             try:
-                await self.run_protocol_refresh_once()
+                await self.run_auto_refresh_once()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                debug_logger.log_error(f"[PROTOCOL_REFRESH] 后台任务异常 - {e}")
+                debug_logger.log_error(f"[AUTO_REFRESH] 后台任务异常 - {e}")
+            await asyncio.sleep(60)
+
+    async def _protocol_refresh_loop(self) -> None:
+        await self._auto_refresh_loop()
 
     def start_protocol_refresher(self) -> None:
+        self._register_extension_listener()
         if self._protocol_refresher_task and not self._protocol_refresher_task.done():
             return
-        self._protocol_refresher_task = asyncio.create_task(self._protocol_refresh_loop())
+        self._protocol_refresher_task = asyncio.create_task(self._auto_refresh_loop())
+
+    def start_auto_refresher(self) -> None:
+        self.start_protocol_refresher()
+
+    async def on_extension_registered(self, route_key: str) -> None:
+        """当匹配 route_key 的扩展注册上线时，立刻触发关联 Token 的 AT 临期/过期检查与自动刷新、自动启用。"""
+        try:
+            all_tokens = []
+            try:
+                res = await self.db.get_all_tokens()
+                if isinstance(res, list):
+                    all_tokens = res
+            except Exception:
+                pass
+
+            if all_tokens:
+                tokens = [
+                    t for t in all_tokens
+                    if getattr(t, "auto_refresh_enabled", True) and not getattr(t, "ban_reason", None)
+                ]
+            else:
+                active_res = await self.db.get_active_tokens()
+                tokens = active_res if isinstance(active_res, list) else []
+            normalized_key = (route_key or "").strip()
+            for token in all_tokens:
+                if not token.auto_refresh_enabled or getattr(token, "ban_reason", None):
+                    continue
+                token_route = (getattr(token, "extension_route_key", "") or "").strip()
+                if normalized_key and token_route and token_route != normalized_key:
+                    continue
+                token_id = int(token.id)
+                debug_logger.log_info(
+                    f"[AUTO_REFRESH] 扩展已注册上线 (route_key='{route_key or '-'}')，"
+                    f"检查 Token {token_id} ({token.email}) 的刷新与自动启用状态..."
+                )
+                async def _refresh_and_enable(tid=token_id):
+                    tok = await self.db.get_token(tid)
+                    if not tok:
+                        return
+                    if self._should_refresh_at(tok):
+                        ok = await self._refresh_at(tid)
+                        if ok:
+                            latest = await self.db.get_token(tid)
+                            if latest and not latest.is_active:
+                                await self.enable_token(tid)
+                                debug_logger.log_info(f"[AUTO_REFRESH] Token {tid}: 刷新成功并自动启用")
+                    else:
+                        if not tok.is_active:
+                            await self.enable_token(tid)
+                            debug_logger.log_info(f"[AUTO_REFRESH] Token {tid}: AT 有效，扩展上线后自动启用")
+                asyncio.create_task(_refresh_and_enable())
+        except Exception as e:
+            debug_logger.log_warning(f"[AUTO_REFRESH] 扩展上线触发刷新异常: {e}")
+
+    def _register_extension_listener(self) -> None:
+        try:
+            from .browser_captcha_extension import ExtensionCaptchaService
+            service = ExtensionCaptchaService.get_instance_sync(self.db)
+            if service and self.on_extension_registered not in service._on_register_callbacks:
+                service._on_register_callbacks.append(self.on_extension_registered)
+        except Exception:
+            pass
 
     async def stop_protocol_refresher(self) -> None:
         task = self._protocol_refresher_task
@@ -915,7 +1204,10 @@ class TokenManager:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            debug_logger.log_warning(f"[PROTOCOL_REFRESH] 停止后台任务时出错: {e}")
+            debug_logger.log_warning(f"[AUTO_REFRESH] 停止后台任务时出错: {e}")
+
+    async def stop_auto_refresher(self) -> None:
+        await self.stop_protocol_refresher()
 
     async def ensure_project_exists(self, token_id: int) -> str:
         """Ensure a token has a pooled set of projects and return one in round-robin order."""
@@ -982,6 +1274,16 @@ class TokenManager:
         """
         await self.db.reset_error_count(token_id)
 
+    async def ban_token_for_unusual_activity(self, token_id: int):
+        """因触发 Google 异常活动风控立即将 token 置入临时冷却状态，避免持续占用导致服务完全不可用。"""
+        debug_logger.log_warning(f"[UNUSUAL_ACTIVITY_BAN] 临时禁用/冷却 Token {token_id} (原因: PUBLIC_ERROR_UNUSUAL_ACTIVITY)")
+        await self.db.update_token(
+            token_id,
+            is_active=False,
+            ban_reason="unusual_activity",
+            banned_at=datetime.now(timezone.utc)
+        )
+
     async def ban_token_for_429(self, token_id: int):
         """因429错误立即禁用token
 
@@ -997,19 +1299,18 @@ class TokenManager:
         )
 
     async def auto_unban_429_tokens(self):
-        """自动解禁因429被禁用的token
+        """自动解禁因429或异常活动被禁用的token
 
         规则:
-        - 距离禁用时间12小时后自动解禁
+        - 429 距离禁用时间12小时后自动解禁
+        - unusual_activity 距离禁用时间1小时后自动解禁
         - 仅解禁未过期的token
-        - 仅解禁因429被禁用的token
         """
         all_tokens = await self.db.get_all_tokens()
         now = datetime.now(timezone.utc)
 
         for token in all_tokens:
-            # 跳过非429禁用的token
-            if token.ban_reason != "429_rate_limit":
+            if token.ban_reason not in ("429_rate_limit", "unusual_activity"):
                 continue
 
             # 跳过未禁用的token
@@ -1039,11 +1340,11 @@ class TokenManager:
             else:
                 banned_at_aware = token.banned_at
 
-            # 检查是否已过12小时
+            cooldown_seconds = 3600 if token.ban_reason == "unusual_activity" else 12 * 3600
             time_since_ban = now - banned_at_aware
-            if time_since_ban.total_seconds() >= 12 * 3600:  # 12小时
+            if time_since_ban.total_seconds() >= cooldown_seconds:
                 debug_logger.log_info(
-                    f"[AUTO_UNBAN] 解禁Token {token.id} (禁用时间: {banned_at_aware}, "
+                    f"[AUTO_UNBAN] 解禁Token {token.id} (原因: {token.ban_reason}, 禁用时间: {banned_at_aware}, "
                     f"已过 {time_since_ban.total_seconds() / 3600:.1f} 小时)"
                 )
                 await self.db.update_token(

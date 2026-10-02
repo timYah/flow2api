@@ -525,6 +525,19 @@ async def build_public_health_snapshot(db: Any) -> dict[str, Any]:
     expired_tokens = 0
     expiring_soon_tokens = 0
     banned_429_tokens = 0
+    extension_connection_count = 0
+
+    if config.captcha_method == "extension":
+        try:
+            # Import lazily to avoid a core/services import cycle during app
+            # startup.  Route keys themselves are intentionally not exposed
+            # by the public health endpoint.
+            from ..services.browser_captcha_extension import ExtensionCaptchaService
+
+            extension_service = await ExtensionCaptchaService.get_instance(db)
+            extension_connection_count = len(extension_service.active_connections)
+        except Exception:
+            extension_connection_count = 0
 
     for row in rows:
         if bool(row.get("is_active")):
@@ -552,6 +565,8 @@ async def build_public_health_snapshot(db: Any) -> dict[str, Any]:
         "tokens_expiring_within_1h": expiring_soon_tokens,
         "banned_429_tokens": banned_429_tokens,
         "captcha_method": config.captcha_method,
+        "extension_connected": extension_connection_count > 0,
+        "extension_connection_count": extension_connection_count,
         "remote_browser_configured": (
             config.captcha_method == "remote_browser"
             and bool((config.remote_browser_base_url or "").strip())

@@ -187,8 +187,6 @@ async def _prepare_captcha_runtime(method: str):
             service = await service_cls.get_instance(db)
             if hasattr(service, "reload_browser_count"):
                 await service.reload_browser_count()
-            if hasattr(service, "warmup_browser_slots"):
-                await service.warmup_browser_slots()
             finish_runtime_prepare(runtime_method, "Chromium 浏览器环境已就绪，可以开始使用有头浏览器打码。")
             return
 
@@ -787,13 +785,32 @@ async def change_password(
     return {"success": True, "message": "密码修改成功,请重新登录"}
 
 
+def _to_utc_iso(value):
+    if not value:
+        return None
+    if hasattr(value, "isoformat"):
+        if getattr(value, "tzinfo", None) is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        if " " in s and "T" not in s:
+            s = s.replace(" ", "T")
+        if not s.endswith("Z") and not ("+" in s[10:] or "-" in s[10:]):
+            s += "Z"
+        return s
+    return value
+
+
 # ========== Token Management ==========
 
 @router.get("/api/tokens")
 async def get_tokens(token: str = Depends(verify_admin_token)):
     """Get all tokens with statistics"""
     token_rows = await db.get_all_tokens_with_stats()
-    to_iso = lambda value: value.isoformat() if hasattr(value, "isoformat") else value
+    to_iso = _to_utc_iso
     now = datetime.now(timezone.utc)
 
     def normalize_dt(value):
@@ -1029,7 +1046,7 @@ async def refresh_at(
 ):
     """手动刷新Token的AT (使用ST转换) 🆕
     
-    如果 AT 刷新失败且处于 personal 模式，会自动尝试通过浏览器刷新 ST
+    如果 AT 刷新失败且处于 personal 或 extension 模式，会自动尝试通过浏览器刷新 ST
     """
     from ..core.logger import debug_logger
     from ..core.config import config
@@ -1043,35 +1060,88 @@ async def refresh_at(
         if success:
             # 获取更新后的token信息
             updated_token = await token_manager.get_token(token_id)
-            
-            message = "AT刷新成功"
-            if config.captcha_method == "personal":
+            if updated_token and not updated_token.is_active:
+                await token_manager.enable_token(token_id)
+                updated_token = await token_manager.get_token(token_id)
+
+            message = "AT刷新成功并已自动启用"
+            if config.captcha_method in ("personal", "extension"):
                 message += "（支持ST自动刷新）"
-            
-            debug_logger.log_info(f"[API] AT 刷新成功: token_id={token_id}")
-            
+
+            debug_logger.log_info(f"[API] AT 刷新成功并已自动启用: token_id={token_id}")
+
             return {
                 "success": True,
                 "message": message,
                 "token": {
                     "id": updated_token.id,
                     "email": updated_token.email,
+                    "is_active": updated_token.is_active,
                     "at_expires": updated_token.at_expires.isoformat() if updated_token.at_expires else None
                 }
             }
         else:
             debug_logger.log_error(f"[API] AT 刷新失败: token_id={token_id}")
-            
-            error_detail = "AT刷新失败"
-            if config.captcha_method != "personal":
-                error_detail += f"（当前打码模式: {config.captcha_method}，ST自动刷新仅在 personal 模式下可用）"
-            
-            raise HTTPException(status_code=500, detail=error_detail)
+
+            token_obj = await token_manager.get_token(token_id)
+            error_detail = token_manager.get_last_refresh_error(token_id)
+            if not error_detail:
+                error_detail = "AT刷新失败"
+                if config.captcha_method == "extension":
+                    route_key = (getattr(token_obj, "extension_route_key", "") or "").strip()
+                    error_detail += f"：Session Token (ST) 已失效且目标 Chrome 扩展未连接 (route_key='{route_key or 'default'}')。请确保 Chrome 扩展在线并登录 Google"
+                elif config.captcha_method == "personal":
+                    error_detail += "：Session Token (ST) 已失效且内置浏览器刷新 ST 失败。请检查浏览器状态"
+                else:
+                    error_detail += f"（当前打码模式: {config.captcha_method}，请更新 ST）"
+
+            raise HTTPException(status_code=400, detail=error_detail)
     except HTTPException:
         raise
     except Exception as e:
         debug_logger.log_error(f"[API] 刷新AT异常: {str(e)}")
         raise HTTPException(status_code=500, detail=f"刷新AT失败: {str(e)}")
+
+
+@router.get("/api/extensions/status")
+async def get_extensions_status(token: str = Depends(verify_admin_token)):
+    """Get active Chrome extension connections and online route keys"""
+    try:
+        from ..services.browser_captcha_extension import ExtensionCaptchaService
+        service = await ExtensionCaptchaService.get_instance(db)
+        routes = [
+            {
+                "route_key": conn.route_key or "",
+                "client_label": conn.client_label or "",
+            }
+            for conn in service.active_connections
+        ]
+        return {
+            "success": True,
+            "connected_count": len(service.active_connections),
+            "routes": routes,
+            "online_route_keys": list({(conn.route_key or "").strip() for conn in service.active_connections})
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e), "connected_count": 0, "routes": [], "online_route_keys": []}
+
+
+@router.post("/api/extensions/reload")
+async def reload_extensions(token: str = Depends(verify_admin_token)):
+    """通知所有在线 Chrome 扩展重新加载自身（热载最新代码）"""
+    try:
+        from ..services.browser_captcha_extension import ExtensionCaptchaService
+        service = await ExtensionCaptchaService.get_instance(db)
+        reloaded = 0
+        for conn in list(service.active_connections):
+            try:
+                await conn.websocket.send_text(json.dumps({"type": "reload_extension"}))
+                reloaded += 1
+            except Exception:
+                pass
+        return {"success": True, "reloaded_count": reloaded}
+    except Exception as e:
+        return {"success": False, "error": str(e), "reloaded_count": 0}
 
 
 @router.post("/api/tokens/st2at")
@@ -1498,8 +1568,8 @@ async def get_logs(
             "duration": log.get("duration"),
             "status_text": log.get("status_text") or "",
             "progress": log.get("progress") or 0,
-            "created_at": log.get("created_at"),
-            "updated_at": log.get("updated_at"),
+            "created_at": _to_utc_iso(log.get("created_at")),
+            "updated_at": _to_utc_iso(log.get("updated_at")),
             "error_summary": _extract_error_summary(log.get("response_body_excerpt")) if status_code is not None and status_code >= 400 else "",
         })
     return result
@@ -1527,8 +1597,8 @@ async def get_log_detail(
         "duration": log.get("duration"),
         "status_text": log.get("status_text") or "",
         "progress": log.get("progress") or 0,
-        "created_at": log.get("created_at"),
-        "updated_at": log.get("updated_at"),
+        "created_at": _to_utc_iso(log.get("created_at")),
+        "updated_at": _to_utc_iso(log.get("updated_at")),
         "error_summary": error_summary,
         "request_body": log.get("request_body"),
         "response_body": log.get("response_body")
@@ -1644,7 +1714,7 @@ async def get_token_refresh_config(token: str = Depends(verify_admin_token)):
     return {
         "success": True,
         "config": {
-            "at_auto_refresh_enabled": True,
+            "at_auto_refresh_enabled": refresh_config.enabled,
             "protocol_refresh_enabled": refresh_config.enabled,
             "refresh_interval_minutes": refresh_config.refresh_interval_minutes,
         }
@@ -1678,7 +1748,7 @@ async def update_token_refresh_config(
     return {
         "success": True,
         "config": {
-            "at_auto_refresh_enabled": True,
+            "at_auto_refresh_enabled": refresh_config.enabled,
             "protocol_refresh_enabled": refresh_config.enabled,
             "refresh_interval_minutes": refresh_config.refresh_interval_minutes,
         }

@@ -47,6 +47,7 @@ ENV/
 # Project specific
 data/*.db
 data/*.db-journal
+browser_data_rt/
 tmp/*
 logs/*
 *.log

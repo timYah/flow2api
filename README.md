@@ -3,7 +3,7 @@
 <div align="center">
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/fastapi-0.119.0-green.svg)](https://fastapi.tiangolo.com/)
 [![Docker](https://img.shields.io/badge/docker-supported-blue.svg)](https://www.docker.com/)
 
@@ -47,7 +47,7 @@
 - 🎨 **文生图** / **图生图**
 - 🎬 **文生视频** / **图生视频**
 - 🎞️ **首尾帧视频**
-- 🔄 **AT/ST自动刷新** - AT 过期自动刷新，ST 过期时自动通过浏览器更新（personal 模式）
+- 🔄 **AT/ST自动刷新** - AT 过期自动刷新，ST 过期时自动通过浏览器更新（personal / extension 模式）
 - 📊 **余额显示** - 实时查询和显示 VideoFX Credits
 - 🚀 **负载均衡** - 多 Token 轮询和并发控制
 - 🌐 **代理支持** - 支持 HTTP/SOCKS5 代理
@@ -61,7 +61,8 @@
 ### 前置要求
 
 - Docker 和 Docker Compose（推荐）
-- 或 Python 3.8+
+- 或 Python 3.9+ 与 [uv](https://docs.astral.sh/uv/)
+- `personal`（nodriver）打码模式需要 Python 3.10+；Python 3.9 仍可运行其他模式
 
 - 由于Flow增加了额外的验证码，你可以自行选择使用浏览器打码或第三发打码：
 注册[YesCaptcha](https://yescaptcha.com/i/13Xd8K)并获取api key，将其填入系统配置页面```YesCaptcha API密钥```区域
@@ -70,6 +71,26 @@
 如需 Docker 内有头打码（browser/personal），请使用下方 `docker-compose.headed.yml`。
 
 - 自动更新st浏览器拓展：[Flow2API-Token-Updater](https://github.com/TheSmallHanCat/Flow2API-Token-Updater)
+
+#### Chrome 验证码扩展（extension）
+
+仓库内的 [`extension/`](extension/) 是验证码扩展。图片生成使用扩展模式时，扩展会在已登录的 Chrome Flow 项目页内完成 reCAPTCHA 和 Flow 请求提交，确保 token 与 Chrome 的 Cookie、网络和浏览器环境一致。它与上面的 Token 同步插件不是同一个扩展。
+
+1. 启动 Flow2API，并在管理台的“系统配置”中确认 API Key。
+2. 在 Chrome 地址栏打开 `chrome://extensions`，开启“开发者模式”，点击“加载已解压的扩展程序”，选择本仓库的 `extension/` 目录。
+3. 打开扩展详情中的“扩展程序选项”，填写：
+   - `WebSocket URL`：本机默认填写 `ws://127.0.0.1:8000/captcha_ws`
+   - `Flow2API API Key`：管理台“API 密钥配置”中的 API Key
+   - `Route Key`：单个扩展实例的标识，可选；多账号使用时每个 Chrome 实例填写不同值
+   - `Client Label`：可选的人类可读名称
+4. 回到管理台“系统配置 → 验证码配置”，将“打码方式”设为 `Chrome 扩展打码`。
+5. 在每个 Token 的详情中填写“扩展路由键”，并确保它与目标 Chrome 扩展的 `Route Key` 完全一致。未填写 Route Key 的扩展连接只用于未指定路由的 Token。
+
+扩展需要保持 Chrome 运行并保持 Google Labs 登录状态。扩展设置页的“运行状态”会显示 WebSocket 连接、当前任务、最近错误和最近 100 条脱敏日志；若生成请求提示扩展超时或脚本失败，先在该页面查看具体阶段，再检查 WebSocket URL、API Key、Route Key 是否一致。
+
+更新仓库中的扩展文件后，请在 `chrome://extensions` 对该扩展点击“重新加载”，确认版本显示为 `1.2.5`，否则 Chrome 仍会运行旧版后台脚本。
+
+如果外部生成工具启用了“自动 Flow2API project ID”，它仍会将自动生成的 project ID 传给 API，并将请求绑定到该项目所属账号。扩展脚本或连接故障不会禁用该账号；如果账号此前已因旧版本故障被自动禁用，需要在管理台手动启用一次。
 
 ### 方式一：Docker 部署（推荐）
 
@@ -117,27 +138,32 @@ docker compose -f docker-compose.headed.yml logs -f
 - API 端口：`8000`
 - 进入管理后台后，将验证码方式设为 `browser` 或 `personal`
 
+`browser` 模式会为每个 Token 使用独立的持久化 Chrome profile，目录位于
+`browser_data_rt/accounts/token_<token_id>`。浏览器按请求懒启动，`browser_count`
+表示同时运行的账户浏览器最大数量；达到上限时优先回收空闲浏览器，profile 不会被删除。
+使用 Docker 有头模式时请保留 `./browser_data_rt:/app/browser_data_rt` 挂载，以便重建容器后继续复用登录状态。
+
 ### 方式二：本地部署
 
 ```bash
+# macOS/Linux 安装 uv（已有 uv 可跳过）
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
 # 克隆项目
 git clone https://github.com/TheSmallHanCat/flow2api.git
 cd flow2api
 
-# 创建虚拟环境
-python -m venv venv
-
-# 激活虚拟环境
-# Windows
-venv\Scripts\activate
-# Linux/Mac
-source venv/bin/activate
-
-# 安装依赖
-pip install -r requirements.txt
+# uv 会根据 .python-version 创建项目虚拟环境并按 uv.lock 安装依赖
+uv sync
 
 # 启动服务
-python main.py
+uv run python main.py
+```
+
+开发/运行测试：
+
+```bash
+uv run python -m pytest
 ```
 
 ### 首次访问
@@ -162,6 +188,7 @@ Prometheus 可直接抓 `/metrics`。如果部署到 Kubernetes，建议只在�
 - 按分类浏览所有可用模型（图片生成、文/图生视频、多图视频、视频放大等）
 - 输入提示词一键测试，流式显示生成进度
 - 图生图 / 图生视频场景支持上传图片
+- 图片生成支持控制生成数量（1~4 张）
 - 生成完成后直接预览图片或视频
 
 ## 📋 支持的模型
@@ -363,6 +390,7 @@ Prometheus 可直接抓 `/metrics`。如果部署到 Kubernetes，建议只在�
 > - `generationConfig.responseModalities`
 > - `generationConfig.imageConfig.aspectRatio`
 > - `generationConfig.imageConfig.imageSize`
+> - `project_id`（可选；传入已存在的真实 project ID 或客户端别名时直接复用；首次传入新值时自动创建并绑定，不传则按现有 Token/project 池逻辑）
 
 ### Gemini 官方 generateContent（文生图）
 
@@ -374,6 +402,7 @@ curl -X POST "http://localhost:8000/models/gemini-3.1-flash-image:generateConten
   -H "x-goog-api-key: han1234" \
   -H "Content-Type: application/json" \
   -d '{
+    "project_id": "<project_id_or_client_alias>",
     "systemInstruction": {
       "parts": [
         {
@@ -409,6 +438,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gemini-3.1-flash-image-landscape",
+    "project_id": "<project_id_or_client_alias>",
     "messages": [
       {
         "role": "user",
@@ -581,4 +611,3 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 ## Star History
 
 [![Star History Chart](https://star-history.dera.page/svg?repos=TheSmallHanCat/flow2api&type=date&legend=top-left)](https://star-history.dera.page/#TheSmallHanCat/flow2api&type=date&legend=top-left)
-

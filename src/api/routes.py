@@ -6,6 +6,7 @@ import base64
 import json
 import mimetypes
 import re
+import time
 from urllib.parse import urlparse
 
 from curl_cffi.requests import AsyncSession
@@ -80,6 +81,7 @@ class NormalizedGenerationRequest:
     images: List[bytes]
     messages: Optional[List[ChatMessage]] = None
     video_media_id: Optional[str] = None
+    project_id: Optional[str] = None
 
 
 def set_generation_handler(handler: GenerationHandler):
@@ -440,12 +442,14 @@ async def _normalize_openai_request(
             images=images,
             messages=request.messages,
             video_media_id=video_media_id,
+            project_id=(request.project_id or "").strip() or None,
         )
 
     if request.contents:
         gemini_request = GeminiGenerateContentRequest(
             contents=_coerce_gemini_contents(request.contents),
             generationConfig=request.generationConfig,
+            project_id=request.project_id,
         )
         normalized = await _normalize_gemini_request(request.model, gemini_request)
         normalized.messages = request.messages
@@ -481,6 +485,7 @@ async def _normalize_gemini_request(
         model=resolved_model,
         prompt=prompt,
         images=images,
+        project_id=(request.project_id or "").strip() or None,
     )
 
 
@@ -490,6 +495,7 @@ async def _collect_non_stream_result(
     images: List[bytes],
     base_url_override: Optional[str] = None,
     video_media_id: Optional[str] = None,
+    project_id: Optional[str] = None,
 ) -> str:
     handler = _ensure_generation_handler()
     result = None
@@ -500,6 +506,7 @@ async def _collect_non_stream_result(
         stream=False,
         base_url_override=base_url_override,
         video_media_id=video_media_id,
+        project_id=project_id,
     ):
         result = chunk
 
@@ -586,6 +593,12 @@ def _enrich_payload_with_direct_url(payload: Dict[str, Any]) -> Dict[str, Any]:
     extracted_url = _extract_url_from_openai_payload(payload)
     if extracted_url and not payload.get("url"):
         payload["url"] = extracted_url
+    if not payload.get("media_id"):
+        choices = payload.get("choices", [])
+        if choices and isinstance(choices[0], dict):
+            msg = choices[0].get("message", {})
+            if isinstance(msg, dict) and msg.get("media_id"):
+                payload["media_id"] = msg.get("media_id")
     return payload
 
 
@@ -659,19 +672,25 @@ async def _build_gemini_success_payload(
     response_model: str,
 ) -> Dict[str, Any]:
     output = _extract_openai_message_content(payload)
-    return {
-        "candidates": [
-            {
-                "content": {
-                    "role": "model",
-                    "parts": await _build_gemini_parts_from_output(output),
-                },
-                "finishReason": "STOP",
-                "index": 0,
-            }
-        ],
+    media_id = payload.get("media_id")
+    candidate: Dict[str, Any] = {
+        "content": {
+            "role": "model",
+            "parts": await _build_gemini_parts_from_output(output),
+        },
+        "finishReason": "STOP",
+        "index": 0,
+    }
+    if media_id:
+        candidate["mediaId"] = media_id
+
+    res: Dict[str, Any] = {
+        "candidates": [candidate],
         "modelVersion": response_model,
     }
+    if media_id:
+        res["mediaId"] = media_id
+    return res
 
 
 def _normalize_finish_reason(reason: Optional[str]) -> Optional[str]:
@@ -699,6 +718,7 @@ async def _convert_openai_stream_chunk_to_gemini_event(
     finish_reason = _normalize_finish_reason(choice.get("finish_reason"))
 
     candidate: Dict[str, Any] = {"index": choice.get("index", 0)}
+    media_id = payload.get("media_id") or delta.get("media_id")
     if text:
         candidate["content"] = {
             "role": "model",
@@ -706,6 +726,8 @@ async def _convert_openai_stream_chunk_to_gemini_event(
         }
     if finish_reason:
         candidate["finishReason"] = finish_reason
+    if media_id:
+        candidate["mediaId"] = media_id
 
     if len(candidate) == 1:
         return None
@@ -714,6 +736,8 @@ async def _convert_openai_stream_chunk_to_gemini_event(
         "candidates": [candidate],
         "modelVersion": response_model,
     }
+    if media_id:
+        chunk["mediaId"] = media_id
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
@@ -729,6 +753,7 @@ async def _iterate_openai_stream(
         stream=True,
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
+        project_id=normalized.project_id,
     ):
         if chunk.startswith("data: "):
             yield chunk
@@ -753,6 +778,7 @@ async def _iterate_gemini_stream(
         stream=True,
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
+        project_id=normalized.project_id,
     ):
         if chunk.startswith("data: "):
             payload_text = chunk[6:].strip()
@@ -882,6 +908,7 @@ async def create_chat_completion(
                 normalized.images,
                 base_url_override=request_base_url,
                 video_media_id=normalized.video_media_id,
+                project_id=normalized.project_id,
             )
         )
         return _build_openai_json_response(payload)
@@ -916,6 +943,7 @@ async def generate_content(
                     normalized.images,
                     base_url_override=request_base_url,
                     video_media_id=normalized.video_media_id,
+                    project_id=normalized.project_id,
                 )
             )
         )
@@ -974,6 +1002,262 @@ async def stream_generate_content(
             status_code=500,
             content=_build_gemini_error_payload(500, str(exc)),
         )
+
+def _categorize_upscale_error(error: Exception, media_id: str) -> tuple[int, str, str]:
+    """根据上游错误信息，分类出 HTTP 状态码、错误代码与面向前端的详细原因说明
+
+    Returns:
+        (status_code, error_code, user_friendly_message)
+    """
+    error_str = str(error or "").strip()
+    lower_error = error_str.lower()
+
+    # 404 / 资源未找到 / 已被清理
+    if any(k in lower_error for k in ["404", "not_found", "not found", "deleted", "does not exist", "invalid media", "media not found"]):
+        return (
+            404,
+            "media_not_found",
+            f"未找到指定的图片资源 (media_id: {media_id})。可能该图片在 Google 服务器上已过期被自动清理，或不属于当前使用的项目/账号。"
+        )
+
+    # 403 / 跨账号 / 权限拒绝
+    if any(k in lower_error for k in ["403", "permission_denied", "permission denied", "forbidden", "unauthorized"]):
+        return (
+            403,
+            "permission_denied",
+            f"无权访问或放大该图片 (media_id: {media_id})。该图片可能由其他 Google 账号或项目创建，当前账号无权操作。"
+        )
+
+    # 429 / 配额耗尽 / 限频
+    if any(k in lower_error for k in ["429", "resource_exhausted", "quota", "rate limit", "too many requests"]):
+        return (
+            429,
+            "rate_limit_exceeded",
+            "画质升级配额已耗尽或请求过于频繁，触发了 Google 频率限制，请稍后重试或更换账号。"
+        )
+
+    # 验证码 / 打码失败
+    if any(k in lower_error for k in ["recaptcha", "captcha", "打码", "challenge"]):
+        return (
+            502,
+            "captcha_failed",
+            "上游安全验证(reCAPTCHA)未通过，打码服务未能提供有效验证令牌，请检查打码服务或稍后重试。"
+        )
+
+    # 网络超时
+    if any(k in lower_error for k in ["timeout", "timed out", "超时"]):
+        return (
+            504,
+            "upstream_timeout",
+            "连接 Google Flow 超分辨率服务超时，超清放大处理时间过长，请稍后重试。"
+        )
+
+    # 其他未捕获错误
+    return (
+        500,
+        "upscale_failed",
+        f"画质升级失败: {error_str or '未知错误'}"
+    )
+
+
+async def _handle_image_upscale(request: Request) -> JSONResponse:
+    """处理图片分辨率升级核心逻辑"""
+    start_time = time.time()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"code": "invalid_json", "message": "请求体必须为有效的 JSON 格式"}}
+        )
+
+    media_id = str(body.get("media_id") or "").strip()
+    if not media_id:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"code": "missing_media_id", "message": "media_id 不能为空，请提供生图时返回的 media_id"}}
+        )
+
+    raw_resolution = str(body.get("target_resolution") or "2K").strip().upper()
+    if raw_resolution in ("2K", "UPSAMPLE_IMAGE_RESOLUTION_2K"):
+        target_resolution = "UPSAMPLE_IMAGE_RESOLUTION_2K"
+        resolution_name = "2K"
+    elif raw_resolution in ("4K", "UPSAMPLE_IMAGE_RESOLUTION_4K"):
+        target_resolution = "UPSAMPLE_IMAGE_RESOLUTION_4K"
+        resolution_name = "4K"
+    else:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"code": "invalid_resolution", "message": f"不支持的目标分辨率 '{raw_resolution}'，目前仅支持 2K 或 4K"}}
+        )
+
+    response_format = str(body.get("response_format") or "url").strip().lower()
+
+    # 1. 查找 media_id 对应的关联记录 (优先使用当初生图的 token_id 和 project_id)
+    token_id = body.get("token_id")
+    project_id = str(body.get("project_id") or "").strip()
+    user_paygate_tier = None
+    media_record = None
+
+    try:
+        media_record = await generation_handler.db.get_media_record(media_id)
+    except Exception as e:
+        debug_logger.log_warning(f"Failed to query media_record: {e}")
+
+    if media_record:
+        if token_id is None:
+            token_id = media_record.get("token_id")
+        if not project_id:
+            project_id = str(media_record.get("project_id") or "").strip()
+        user_paygate_tier = media_record.get("user_paygate_tier")
+
+    # 2. 定位 Token
+    token = None
+    if token_id is not None:
+        token = await generation_handler.db.get_token(token_id)
+
+    # 若未指定或指定的 Token 不可用，尝试通过负载均衡选择可用 Token
+    if not token or not token.is_active:
+        token = await generation_handler.load_balancer.select_token(
+            for_image_generation=True,
+            reserve=False,
+            enforce_concurrency_filter=False,
+        )
+
+    if not token:
+        duration = time.time() - start_time
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"code": "no_available_token", "message": "当前没有可用的账号/Token 处理升级请求，请检查账号配置"}}
+        )
+
+    # 3. 定位 Project ID
+    if not project_id:
+        project_id = str(token.current_project_id or "").strip()
+        if not project_id and hasattr(generation_handler.token_manager, "get_active_project"):
+            active_proj = await generation_handler.token_manager.get_active_project(token.id)
+            if active_proj:
+                project_id = active_proj.project_id
+
+    if not project_id:
+        try:
+            proj = await generation_handler.token_manager.create_client_project(token, f"upscale_{int(time.time())}")
+            if proj:
+                project_id = proj.project_id
+        except Exception as e:
+            debug_logger.log_warning(f"Failed to auto-create project for upscale: {e}")
+
+    if not user_paygate_tier:
+        user_paygate_tier = token.user_paygate_tier or "PAYGATE_TIER_ONE"
+
+    request_base_url = _get_request_base_url(request)
+
+    # 4. 执行放大调用
+    try:
+        encoded_image = await generation_handler.flow_client.upsample_image(
+            at=token.at,
+            project_id=project_id,
+            media_id=media_id,
+            target_resolution=target_resolution,
+            user_paygate_tier=user_paygate_tier,
+            token_id=token.id
+        )
+
+        if not encoded_image:
+            status_code = 502
+            error_code = "empty_result"
+            err_msg = "Flow 放大接口返回数据为空，画质升级未能完成"
+            duration = time.time() - start_time
+            await generation_handler._log_request(
+                token_id=token.id,
+                operation="upscale_image",
+                request_data=body,
+                response_data={"error": {"code": error_code, "message": err_msg}},
+                status_code=status_code,
+                duration=duration,
+                status_text="failed",
+                progress=0,
+            )
+            return JSONResponse(
+                status_code=status_code,
+                content={"error": {"code": error_code, "message": err_msg, "media_id": media_id}}
+            )
+
+        # 5. 缓存落盘
+        cached_filename = await generation_handler.file_cache.cache_base64_image(encoded_image, resolution_name)
+        local_url = f"{request_base_url}/tmp/{cached_filename}"
+        duration = time.time() - start_time
+
+        # 6. 更新 media_records
+        try:
+            await generation_handler.db.save_media_record(
+                media_id=media_id,
+                token_id=token.id,
+                project_id=project_id,
+                user_paygate_tier=user_paygate_tier,
+                local_url=local_url,
+            )
+        except Exception as e:
+            debug_logger.log_warning(f"Failed to update media record after upscale: {e}")
+
+        # 7. 组装响应与记录日志
+        resp_payload: Dict[str, Any] = {
+            "status": "success",
+            "media_id": media_id,
+            "resolution": resolution_name,
+            "url": local_url,
+            "created_at": int(time.time()),
+        }
+        if response_format in ("b64_json", "both"):
+            resp_payload["b64_json"] = encoded_image
+
+        log_resp_data = dict(resp_payload)
+        if "b64_json" in log_resp_data:
+            log_resp_data["b64_json"] = f"[Base64 string length={len(encoded_image)}]"
+
+        await generation_handler._log_request(
+            token_id=token.id,
+            operation="upscale_image",
+            request_data=body,
+            response_data=log_resp_data,
+            status_code=200,
+            duration=duration,
+            status_text="completed",
+            progress=100,
+        )
+
+        return JSONResponse(status_code=200, content=resp_payload)
+
+    except Exception as e:
+        duration = time.time() - start_time
+        status_code, error_code, friendly_message = _categorize_upscale_error(e, media_id)
+        error_payload = {
+            "code": error_code,
+            "message": friendly_message,
+            "media_id": media_id,
+            "details": str(e),
+        }
+        await generation_handler._log_request(
+            token_id=token.id,
+            operation="upscale_image",
+            request_data=body,
+            response_data={"error": error_payload},
+            status_code=status_code,
+            duration=duration,
+            status_text="failed",
+            progress=0,
+        )
+        return JSONResponse(status_code=status_code, content={"error": error_payload})
+
+
+@router.post("/v1/images/upscale")
+@router.post("/api/upsample")
+async def upscale_image_endpoint(
+    request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """画质升级专门接口 (支持通过 media_id 自动使用 Flow 原生功能进行分辨率升级)"""
+    return await _handle_image_upscale(request)
 
 @router.websocket("/captcha_ws")
 async def captcha_websocket_endpoint(websocket: WebSocket):

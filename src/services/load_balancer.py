@@ -145,6 +145,8 @@ class LoadBalancer:
         reserve: bool = False,
         enforce_concurrency_filter: bool = True,
         track_pending: bool = False,
+        required_token_id: Optional[int] = None,
+        refresh_tier_on_mismatch: bool = False,
     ) -> Optional[Token]:
         """
         Select a token using load-aware balancing
@@ -161,17 +163,33 @@ class LoadBalancer:
             track_pending:
                 Whether to count the selected token as a queued request immediately.
                 This smooths burst distribution before the hard concurrency slot is acquired.
+            required_token_id:
+                If provided, only this token may be selected. No fallback is allowed.
+            refresh_tier_on_mismatch:
+                If True, refresh a token's account information before rejecting it
+                for a cached, insufficient tier.
 
         Returns:
             Selected token or None if no available tokens
         """
         debug_logger.log_info(
             f"[LOAD_BALANCER] 开始选择Token (图片生成={for_image_generation}, "
-            f"视频生成={for_video_generation}, 模型={model}, 预占槽位={reserve})"
+            f"视频生成={for_video_generation}, 模型={model}, 预占槽位={reserve}, "
+            f"指定Token={required_token_id})"
         )
 
         active_tokens = await self.token_manager.get_active_tokens()
         debug_logger.log_info(f"[LOAD_BALANCER] 获取到 {len(active_tokens)} 个活跃Token")
+
+        if required_token_id is not None:
+            active_tokens = [
+                token for token in active_tokens
+                if token.id == required_token_id
+            ]
+            debug_logger.log_info(
+                f"[LOAD_BALANCER] 定向选择 Token {required_token_id}, "
+                f"匹配活跃Token数={len(active_tokens)}"
+            )
 
         if not active_tokens:
             debug_logger.log_info(f"[LOAD_BALANCER] ❌ 没有活跃的Token")
@@ -182,10 +200,19 @@ class LoadBalancer:
         required_tier = get_required_paygate_tier_for_model(model)
 
         for token in active_tokens:
+            token_validated = False
             normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
             if model and not supports_model_for_tier(model, normalized_tier):
-                filtered_reasons[token.id] = '账号等级不足，需要 ' + get_paygate_tier_label(required_tier)
-                continue
+                if refresh_tier_on_mismatch:
+                    refreshed_token = await self.token_manager.ensure_valid_token(token)
+                    if refreshed_token:
+                        token = refreshed_token
+                        token_validated = True
+                        normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
+
+                if not supports_model_for_tier(model, normalized_tier):
+                    filtered_reasons[token.id] = '账号等级不足，需要 ' + get_paygate_tier_label(required_tier)
+                    continue
             if for_image_generation:
                 if not token.image_enabled:
                     filtered_reasons[token.id] = "图片生成已禁用"
@@ -232,7 +259,8 @@ class LoadBalancer:
                 "inflight": inflight,
                 "remaining": remaining,
                 "needs_refresh": self.token_manager.needs_at_refresh(token),
-                "random": random.random()
+                "random": random.random(),
+                "token_validated": token_validated,
             })
 
         if filtered_reasons:
@@ -246,7 +274,7 @@ class LoadBalancer:
 
         # 最低 in-flight 优先；有并发上限时，剩余槽位更多的 token 优先；最后随机打散
         call_mode = config.call_logic_mode
-        if call_mode == "polling":
+        if call_mode == "polling" and required_token_id is None:
             scenario = "default"
             if for_image_generation:
                 scenario = "image"
@@ -293,7 +321,8 @@ class LoadBalancer:
             token = item["token"]
             token_id = token.id
 
-            token = await self.token_manager.ensure_valid_token(token)
+            if not item["token_validated"]:
+                token = await self.token_manager.ensure_valid_token(token)
             if not token:
                 debug_logger.log_info(f"[LOAD_BALANCER] 跳过 Token {token_id}: AT无效或已过期")
                 continue
@@ -351,5 +380,51 @@ class LoadBalancer:
                 return "当前有符合档位的账号，但图片生成功能已全部禁用。"
             if for_video_generation:
                 return "当前有符合档位的账号，但视频生成功能已全部禁用。"
+
+        # Extension mode deliberately filters tokens without a matching Chrome
+        # extension route in ``select_token``.  Report that infrastructure
+        # condition explicitly instead of falling back to the misleading
+        # generic "no available token" message.
+        if capability_tokens and config.captcha_method == "extension":
+            route_available = False
+            route_reasons = []
+            for token in capability_tokens:
+                route_ok, route_reason = await self._check_extension_route(token)
+                if route_ok:
+                    route_available = True
+                    break
+                if route_reason:
+                    route_reasons.append(route_reason)
+
+            if not route_available:
+                try:
+                    from .browser_captcha_extension import ExtensionCaptchaService
+
+                    service = await ExtensionCaptchaService.get_instance(
+                        getattr(self.token_manager, "db", None)
+                    )
+                    available_routes = service.describe_routes() or "none"
+                    if not service.active_connections:
+                        return (
+                            "当前验证码方式为 Chrome 扩展，但没有已连接的扩展。"
+                            "请打开已登录 Google Labs 的 Chrome 扩展并检查 WebSocket URL/API Key。"
+                        )
+
+                    configured_routes = sorted({
+                        str(token.extension_route_key or "").strip() or "(empty)"
+                        for token in capability_tokens
+                    })
+                    route_text = ", ".join(configured_routes)
+                    return (
+                        "当前验证码方式为 Chrome 扩展，但没有与图片/视频 Token 匹配的扩展路由。"
+                        f"Token 所需路由: {route_text}; 可用路由: {available_routes}。"
+                        "请检查 Token 的扩展路由键与扩展设置是否一致。"
+                    )
+                except Exception as exc:
+                    debug_logger.log_warning(
+                        f"[LOAD_BALANCER] 扩展可用性诊断失败: {exc}"
+                    )
+                    if route_reasons:
+                        return route_reasons[0]
 
         return None

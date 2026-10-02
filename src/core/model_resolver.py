@@ -265,6 +265,46 @@ VIDEO_BASE_MODELS = {
         "landscape": "omni",
         "portrait": "omni_portrait",
     },
+    "omni_8s": {
+        "landscape": "omni_8s",
+        "portrait": "omni_8s_portrait",
+    },
+    "omni_10s": {
+        "landscape": "omni_10s",
+        "portrait": "omni_10s_portrait",
+    },
+    "omni-8s": {
+        "landscape": "omni_8s",
+        "portrait": "omni_8s_portrait",
+    },
+    "omni-10s": {
+        "landscape": "omni_10s",
+        "portrait": "omni_10s_portrait",
+    },
+    "omni-flash": {
+        "landscape": "omni",
+        "portrait": "omni_portrait",
+    },
+    "gemini-omni": {
+        "landscape": "omni",
+        "portrait": "omni_portrait",
+    },
+    "gemini-omni-flash": {
+        "landscape": "omni",
+        "portrait": "omni_portrait",
+    },
+    "omini": {
+        "landscape": "omni",
+        "portrait": "omni_portrait",
+    },
+    "omini_8s": {
+        "landscape": "omni_8s",
+        "portrait": "omni_8s_portrait",
+    },
+    "omini_10s": {
+        "landscape": "omni_10s",
+        "portrait": "omni_10s_portrait",
+    },
     # I2V models
     "veo_3_1_i2v_s_fast_fl": {
         "landscape": "veo_3_1_i2v_s_fast_fl",

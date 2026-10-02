@@ -6,7 +6,7 @@ XVFB_SCREEN_VALUE="${XVFB_SCREEN:-1440x900x24}"
 export DISPLAY="${DISPLAY_VALUE}"
 
 resolve_browser_path() {
-python - <<'PY'
+uv run --no-sync python - <<'PY'
 from playwright.sync_api import sync_playwright
 
 with sync_playwright() as p:
@@ -54,4 +54,4 @@ else
     echo "[entrypoint] warning: no valid browser executable found for personal/browser captcha" >&2
 fi
 
-exec python main.py
+exec uv run --no-sync python main.py

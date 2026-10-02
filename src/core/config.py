@@ -119,8 +119,12 @@ class Config:
 
     @property
     def flow_image_request_timeout(self) -> int:
-        """图片生成单次 HTTP 请求超时(秒)。"""
-        default_timeout = min(self.flow_timeout, 40)
+        """图片生成单次 HTTP 请求超时(秒)。
+
+        2K 图片在扩展打码链路上还要叠加建标签页、等 Flow 页面就绪和取码的
+        固定开销，40s 会在多图连续生成时把已成功的结果判成超时。
+        """
+        default_timeout = min(self.flow_timeout, 90)
         timeout = self._config.get("flow", {}).get(
             "image_request_timeout",
             default_timeout
@@ -132,7 +136,7 @@ class Config:
 
     @property
     def flow_image_timeout_retry_count(self) -> int:
-        """图片生成遇到网络超时时的快速重试次数。"""
+        """图片生成遇到网络超时或扩展 Flow fetch 临时错误时的快速重试次数。"""
         retry_count = self._config.get("flow", {}).get("image_timeout_retry_count", 1)
         try:
             return max(0, min(3, int(retry_count)))

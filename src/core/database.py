@@ -432,6 +432,22 @@ class Database:
                     )
                 """)
 
+            if not await self._table_exists(db, "projects"):
+                print("  ✓ Creating missing table: projects")
+                await db.execute("""
+                    CREATE TABLE projects (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        project_id TEXT UNIQUE NOT NULL,
+                        client_project_id TEXT,
+                        token_id INTEGER NOT NULL,
+                        project_name TEXT NOT NULL,
+                        tool_name TEXT DEFAULT 'PINHOLE',
+                        is_active BOOLEAN DEFAULT 1,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (token_id) REFERENCES tokens(id)
+                    )
+                """)
+
             # ========== Step 2: Add missing columns to existing tables ==========
             # Check and add missing columns to tokens table
             if await self._table_exists(db, "tokens"):
@@ -468,6 +484,15 @@ class Database:
                             print(f"  ✓ Added column '{col_name}' to tokens table")
                         except Exception as e:
                             print(f"  ✗ Failed to add column '{col_name}': {e}")
+
+            if await self._table_exists(db, "projects") and not await self._column_exists(
+                db, "projects", "client_project_id"
+            ):
+                try:
+                    await db.execute("ALTER TABLE projects ADD COLUMN client_project_id TEXT")
+                    print("  ✓ Added column 'client_project_id' to projects table")
+                except Exception as e:
+                    print(f"  ✗ Failed to add column 'client_project_id': {e}")
 
             # Check and add missing columns to admin_config table
             if await self._table_exists(db, "admin_config"):
@@ -602,6 +627,12 @@ class Database:
             # It only ensures missing rows are created with default values from setting.toml
             await self._ensure_config_rows(db, config_dict=config_dict)
 
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_project_id ON projects(project_id)")
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_client_project_id "
+                "ON projects(client_project_id) WHERE client_project_id IS NOT NULL"
+            )
+
             await db.commit()
             print("Database migration check completed.")
 
@@ -653,6 +684,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS projects (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     project_id TEXT UNIQUE NOT NULL,
+                    client_project_id TEXT,
                     token_id INTEGER NOT NULL,
                     project_name TEXT NOT NULL,
                     tool_name TEXT DEFAULT 'PINHOLE',
@@ -841,10 +873,32 @@ class Database:
                 )
             """)
 
+            # Media records table (用于跟踪生图生成的 media_id，支撑后续画质升级与跨接口查询)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS media_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    media_id TEXT UNIQUE NOT NULL,
+                    token_id INTEGER NOT NULL,
+                    project_id TEXT NOT NULL,
+                    user_paygate_tier TEXT DEFAULT '',
+                    origin_url TEXT DEFAULT '',
+                    local_url TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (token_id) REFERENCES tokens(id)
+                )
+            """)
+
             # Create indexes
             await db.execute("CREATE INDEX IF NOT EXISTS idx_task_id ON tasks(task_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_token_st ON tokens(st)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_project_id ON projects(project_id)")
+            # Legacy databases receive this column in check_and_migrate_db().
+            # Avoid querying it before that migration runs during startup.
+            if await self._column_exists(db, "projects", "client_project_id"):
+                await db.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_client_project_id "
+                    "ON projects(client_project_id) WHERE client_project_id IS NOT NULL"
+                )
             await db.execute("CREATE INDEX IF NOT EXISTS idx_tokens_email ON tokens(email)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_tokens_is_active_last_used_at ON tokens(is_active, last_used_at)")
 
@@ -857,6 +911,9 @@ class Database:
 
             # Token stats lookup index
             await db.execute("CREATE INDEX IF NOT EXISTS idx_token_stats_token_id ON token_stats(token_id)")
+
+            # Media records lookup index
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_media_records_media_id ON media_records(media_id)")
 
             await db.commit()
 
@@ -1118,9 +1175,11 @@ class Database:
         """Add a new project"""
         async with self._connect(write=True) as db:
             cursor = await db.execute("""
-                INSERT INTO projects (project_id, token_id, project_name, tool_name, is_active)
-                VALUES (?, ?, ?, ?, ?)
-            """, (project.project_id, project.token_id, project.project_name,
+                INSERT INTO projects (
+                    project_id, client_project_id, token_id, project_name, tool_name, is_active
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (project.project_id, project.client_project_id, project.token_id, project.project_name,
                   project.tool_name, project.is_active))
             await db.commit()
             return cursor.lastrowid
@@ -1134,6 +1193,28 @@ class Database:
             if row:
                 return Project(**dict(row))
             return None
+
+    async def get_project_by_client_id(self, client_project_id: str) -> Optional[Project]:
+        """Get a project by its globally unique client alias."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM projects WHERE client_project_id = ?",
+                (client_project_id,),
+            )
+            row = await cursor.fetchone()
+            if row:
+                return Project(**dict(row))
+            return None
+
+    async def clear_project_client_id(self, project_id: str):
+        """Remove a client alias before rebinding it to a replacement project."""
+        async with self._connect(write=True) as db:
+            await db.execute(
+                "UPDATE projects SET client_project_id = NULL WHERE project_id = ?",
+                (project_id,),
+            )
+            await db.commit()
 
     async def get_projects_by_token(self, token_id: int) -> List[Project]:
         """Get all projects for a token"""
@@ -2063,3 +2144,88 @@ class Database:
             await db.commit()
 
         return await self.get_token_refresh_config()
+
+    # Media records operations
+    async def save_media_record(
+        self,
+        media_id: str,
+        token_id: int,
+        project_id: str,
+        user_paygate_tier: Optional[str] = None,
+        origin_url: Optional[str] = None,
+        local_url: Optional[str] = None,
+    ):
+        """Save or update media record mapping"""
+        if not media_id:
+            return
+        async with self._connect(write=True) as db:
+            await db.execute("""
+                INSERT INTO media_records (media_id, token_id, project_id, user_paygate_tier, origin_url, local_url)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(media_id) DO UPDATE SET
+                    token_id = excluded.token_id,
+                    project_id = excluded.project_id,
+                    user_paygate_tier = excluded.user_paygate_tier,
+                    origin_url = CASE WHEN excluded.origin_url != '' THEN excluded.origin_url ELSE media_records.origin_url END,
+                    local_url = CASE WHEN excluded.local_url != '' THEN excluded.local_url ELSE media_records.local_url END
+            """, (
+                str(media_id).strip(),
+                token_id,
+                str(project_id or "").strip(),
+                str(user_paygate_tier or "").strip(),
+                str(origin_url or "").strip(),
+                str(local_url or "").strip(),
+            ))
+            await db.commit()
+
+    async def get_media_record(self, media_id: str) -> Optional[Dict[str, Any]]:
+        """Get media record by media_id, with fallback to request_logs for legacy records"""
+        if not media_id:
+            return None
+        media_id = str(media_id).strip()
+        async with self._connect() as db:
+            cursor = await db.execute("""
+                SELECT media_id, token_id, project_id, user_paygate_tier, origin_url, local_url, created_at
+                FROM media_records
+                WHERE media_id = ?
+                LIMIT 1
+            """, (media_id,))
+            row = await cursor.fetchone()
+            if row:
+                return {
+                    "media_id": row[0],
+                    "token_id": row[1],
+                    "project_id": row[2],
+                    "user_paygate_tier": row[3],
+                    "origin_url": row[4],
+                    "local_url": row[5],
+                    "created_at": row[6],
+                }
+
+            # Fallback for legacy request_logs
+            like_pattern = f"%{media_id}%"
+            cursor = await db.execute("""
+                SELECT token_id, response_body, created_at
+                FROM request_logs
+                WHERE response_body LIKE ? AND status_code = 200
+                ORDER BY id DESC
+                LIMIT 1
+            """, (like_pattern,))
+            legacy_row = await cursor.fetchone()
+            if legacy_row:
+                try:
+                    resp_data = json.loads(legacy_row[1]) if legacy_row[1] else {}
+                    assets = resp_data.get("generated_assets", {})
+                    return {
+                        "media_id": media_id,
+                        "token_id": legacy_row[0],
+                        "project_id": "",
+                        "user_paygate_tier": "",
+                        "origin_url": assets.get("origin_image_url") or "",
+                        "local_url": assets.get("final_image_url") or "",
+                        "created_at": legacy_row[2],
+                    }
+                except Exception:
+                    pass
+
+        return None
