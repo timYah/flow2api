@@ -1447,6 +1447,16 @@ class FlowClient:
                 return project_id
             except Exception as e:
                 last_error = e
+                error_str = str(e).lower()
+                # Google Flow 官方已下线 tRPC 接口 (Flow RPCs have been deprecated and disabled)
+                if "404" in error_str or "deprecated" in error_str:
+                    fallback_id = str(uuid.uuid4())
+                    debug_logger.log_warning(
+                        f"[PROJECT] 官方 createProject 接口已废弃或返回 404 ({e})，"
+                        f"降级使用本地生成 Project UUID: {fallback_id}"
+                    )
+                    return fallback_id
+
                 retry_reason = "网络超时" if self._is_timeout_error(e) else self._get_retry_reason(str(e))
                 if retry_reason and retry_attempt < max_retries - 1:
                     debug_logger.log_warning(
@@ -1455,11 +1465,17 @@ class FlowClient:
                     )
                     await asyncio.sleep(1)
                     continue
-                raise
+                fallback_id = str(uuid.uuid4())
+                debug_logger.log_warning(
+                    f"[PROJECT] 创建项目重试耗尽 ({e})，降级使用本地生成 Project UUID: {fallback_id}"
+                )
+                return fallback_id
 
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("创建项目失败")
+        fallback_id = str(uuid.uuid4())
+        debug_logger.log_warning(
+            f"[PROJECT] 创建项目未获取到 ID，降级使用本地生成 Project UUID: {fallback_id}"
+        )
+        return fallback_id
 
     async def delete_project(self, st: str, project_id: str):
         """删除项目

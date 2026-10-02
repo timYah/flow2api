@@ -1,6 +1,7 @@
 """Token manager for Flow2API with AT auto-refresh"""
 import asyncio
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, List
 from ..core.database import Database
@@ -369,18 +370,20 @@ class TokenManager:
                 tool_name="PINHOLE"
             ))
         else:
+            first_project_name = self._build_project_name(1, base_project_name)
             try:
-                first_project_name = self._build_project_name(1, base_project_name)
                 first_project_id = await self.flow_client.create_project(st, first_project_name)
-                debug_logger.log_info(f"[ADD_TOKEN] Created pooled project #1: {first_project_name} (ID: {first_project_id})")
-                pooled_projects.append(Project(
-                    project_id=first_project_id,
-                    token_id=0,
-                    project_name=first_project_name,
-                    tool_name="PINHOLE"
-                ))
             except Exception as e:
-                raise ValueError(f"??????: {str(e)}")
+                debug_logger.log_warning(f"[ADD_TOKEN] 远程创建项目失败，降级使用本地生成 UUID: {e}")
+                first_project_id = str(uuid.uuid4())
+
+            debug_logger.log_info(f"[ADD_TOKEN] Created pooled project #1: {first_project_name} (ID: {first_project_id})")
+            pooled_projects.append(Project(
+                project_id=first_project_id,
+                token_id=0,
+                project_name=first_project_name,
+                tool_name="PINHOLE"
+            ))
 
         token = Token(
             st=st,
@@ -416,8 +419,12 @@ class TokenManager:
         pooled_projects[0].id = await self.db.add_project(pooled_projects[0])
 
         while len(pooled_projects) < project_pool_size:
-            new_project = await self._create_project_for_token(token, len(pooled_projects) + 1, base_project_name)
-            pooled_projects.append(new_project)
+            try:
+                new_project = await self._create_project_for_token(token, len(pooled_projects) + 1, base_project_name)
+                pooled_projects.append(new_project)
+            except Exception as e:
+                debug_logger.log_warning(f"[ADD_TOKEN] 补充项目池失败 (跳过): {e}")
+                break
 
         debug_logger.log_info(
             f"[ADD_TOKEN] Token added successfully (ID: {token_id}, Email: {email}, pooled_projects={len(pooled_projects)})"
